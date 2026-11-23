@@ -580,8 +580,9 @@ describe('daemon-backed native input visibility', () => {
       await expect(page.pressKey('Enter')).rejects.toMatchObject({ code: 'COMMAND_EXEC' });
       await expect(page.clickWithQuads('1')).rejects.toMatchObject({ code: 'COMMAND_EXEC' });
     } finally { delete process.env.OPENCLI_INPUT_GUARD; }
-    expect(sendCommandMock.mock.calls.every(([action]) => action === 'exec')).toBe(true);
-    expect(sendCommandMock.mock.calls.every(([, args]) => args.code.includes('document.visibilityState'))).toBe(true);
+    // Only the foreground queue and the visibility check ran: no input reached CDP.
+    expect(sendCommandMock.mock.calls.some(([action]) => action === 'cdp')).toBe(false);
+    expect(sendCommandMock.mock.calls.filter(([action]) => action === 'exec').every(([, args]) => args.code.includes('document.visibilityState'))).toBe(true);
   });
   it('AIRA default on a hidden page: mouse input is refused, keys go through for the caller to check', async () => {
     sendCommandMock.mockResolvedValue('hidden');
