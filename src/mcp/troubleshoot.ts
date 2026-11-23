@@ -29,6 +29,7 @@ const RULES: Rule[] = [
   { when: /REFUSED_NOT_VISIBLE/i, next: 'The target has no visible box. Open the menu or section that contains it, or do=scroll, then do=look for a fresh ref.' },
   { when: /NOT_FOUND|no option labelled|not found/i, next: 'The ref or label no longer exists. Call do=look (optionally with find) and use a ref from the new OPTIONS.' },
   { when: /options match/i, next: 'The label is ambiguous. Use the ref number, or label:<role>:<exact name>.' },
+  { when: /Native input requires a visible/i, next: 'The tab is hidden and could not be activated. Call do=open with the same url (it re-creates the tab), then repeat the step once; if it fails again, stop and tell the user to bring the Chrome window to the front.' },
   { when: /MISSED/i, next: 'Another element took the click. Call do=look, close what is in the way, then click the ref again once.' },
   { when: /NO_CHANGE/i, next: 'The click landed but nothing changed. The control may need hover or focus first, or the page is still busy: do=wait seconds=1, then do=look.' },
   { when: /file not found/i, next: 'Pass absolute paths of files that exist on this machine.' },
@@ -64,7 +65,8 @@ export const PLAYBOOK = [
   '- ERR upload FAILED       → read the per-strategy lines; pass target=<ref of upload button>, then clipboard=true as a last resort.',
   '- OPTIONS is empty        → the page is loading: do=wait selector=<css> or seconds=2.',
   '- Wrong page / tab gone   → do=open again.',
-  '- Unsure what is on screen → do=shot (numbers on the picture are the refs).',
+  '- Screenshots are rarely needed: OPTIONS already lists what can be clicked and do=read gives the text. do=shot saves a PNG under ~/.opencli/aira-mcp/shots/ and prints the path.',
+  '- "via dom" in a result → the tab was hidden, so the action ran inside the page; it worked unless the verdict says otherwise.',
   '- Same error twice        → do=debug, report the last lines to the user; do not loop.',
 ].join('\n');
 

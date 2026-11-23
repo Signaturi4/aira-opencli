@@ -16,7 +16,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import type { IPage } from '../types.js';
 import { preciseClick, preciseTargets, type PreciseTargetsResult } from '../browser/precise.js';
-import { describeUpload, smartUpload } from '../browser/upload.js';
+import { describeUpload, smartUpload, type SmartUploadResult } from '../browser/upload.js';
 import { renderScreen } from './screen.js';
 import { hintFor, PLAYBOOK, readLog } from './troubleshoot.js';
 
@@ -204,6 +204,64 @@ function readJs(target: string | undefined, limit: number): string {
  * not depend on ref numbers that only exist after an earlier step.
  * `label:button:Send` narrows by role. Exact name wins over "contains".
  */
+let lastUploadDetail = '';
+
+/** Upload answer for the agent: verdict and count on success, the per-strategy lines only on failure. */
+export function uploadLine(r: SmartUploadResult): string {
+  return r.verdict === 'PASS' ? `PASS attached ${r.files.length} of ${r.files.length}` : describeUpload(r);
+}
+
+/** Screenshots go next to the logs, a place the calling agent can read. */
+export function shotPath(given: string | undefined): string {
+  if (given) return path.resolve(given.replace(/^~(?=\/)/, os.homedir()));
+  const dir = path.join(process.env.OPENCLI_MCP_LOG_DIR || path.join(os.homedir(), '.opencli', 'aira-mcp'), 'shots');
+  return path.join(dir, `shot-${new Date().toISOString().replace(/[:.]/g, '-')}.png`);
+}
+
+function isHidden(err: unknown): boolean {
+  return /Native input requires a visible/i.test(String((err as Error)?.message ?? err));
+}
+
+/** Page-side: insert text into the focused field without trusted input. */
+function domTypeJs(text: string): string {
+  return `
+    (() => {
+      const el = document.activeElement;
+      if (!el || el === document.body) return false;
+      if (document.execCommand && document.execCommand('insertText', false, ${JSON.stringify(text)})) return true;
+      if ('value' in el) {
+        const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const set = Object.getOwnPropertyDescriptor(proto, 'value');
+        if (set && set.set) set.set.call(el, (el.value || '') + ${JSON.stringify(text)}); else el.value += ${JSON.stringify(text)};
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        return true;
+      }
+      return false;
+    })()
+  `;
+}
+
+/** Trusted key press, or on a hidden tab an in-page key event (untrusted; some sites ignore it). */
+async function pressKeyAnyway(page: IPage, key: string): Promise<string> {
+  try {
+    await page.pressKey(key);
+    return '';
+  } catch (err) {
+    if (!isHidden(err)) throw err;
+    await page.evaluate(`
+      (() => {
+        const el = document.activeElement || document.body;
+        const key = ${JSON.stringify(key)};
+        const init = { key, code: key.length === 1 ? 'Key' + key.toUpperCase() : key, bubbles: true, cancelable: true, composed: true, keyCode: key === 'Enter' ? 13 : key === 'Escape' ? 27 : 0, which: key === 'Enter' ? 13 : key === 'Escape' ? 27 : 0 };
+        el.dispatchEvent(new KeyboardEvent('keydown', init));
+        el.dispatchEvent(new KeyboardEvent('keypress', init));
+        el.dispatchEvent(new KeyboardEvent('keyup', init));
+      })()
+    `);
+    return ' via dom key event (hidden tab, untrusted)';
+  }
+}
+
 export async function resolveLabel(page: IPage, raw: string): Promise<string | { error: string; next: string }> {
   const m = /^([a-z]+):(.+)$/i.exec(raw.trim());
   const role = m ? m[1].toLowerCase() : null;
@@ -213,6 +271,12 @@ export async function resolveLabel(page: IPage, raw: string): Promise<string | {
   const exact = pool.filter((t) => t.name.toLowerCase() === want);
   const hits = exact.length > 0 ? exact : pool.filter((t) => t.name.toLowerCase().includes(want));
   if (hits.length === 1) return String(hits[0].ref);
+  if (exact.length > 1) {
+    // Same exact name several times (menu + toolbar copies): take the one a person would click.
+    const rank = (t: PreciseTargetsResult['targets'][number]) => (t.in_viewport ? 0 : 4) + (t.covered_by ? 2 : 0) + (t.disabled ? 1 : 0);
+    const best = [...exact].sort((a, b) => rank(a) - rank(b) || a.y - b.y || a.x - b.x || a.ref - b.ref)[0];
+    return String(best.ref);
+  }
   if (hits.length === 0) return { error: `no option labelled "${raw}"`, next: 'Call do=look and use a ref or an exact label from OPTIONS.' };
   return {
     error: `${hits.length} options match "${raw}": ${hits.slice(0, 6).map((t) => `${t.ref} ${t.role || t.tag} "${t.name}"`).join(' | ')}`,
@@ -286,28 +350,38 @@ async function actInner(page: IPage, input: ActInput, opts: { screen?: boolean }
           r.verdict === 'MISSED' && r.landed_on ? `landed on ${r.landed_on}` : '',
           r.message ?? '',
         ].filter(Boolean).join('; ');
-        const head = `${good ? 'OK' : 'ERR'} click ${target} -> ${r.verdict}${detail ? ` (${detail})` : ''} ${ms()}`;
+        const via = r.click_method === 'dom' ? ' via dom (hidden tab, untrusted)' : '';
+        const head = `${good ? 'OK' : 'ERR'} click ${target} -> ${r.verdict}${via}${detail ? ` (${detail})` : ''} ${ms()}`;
         return { ok: good, text: `${head}${r.verdict === 'PASS' ? '' : `\nNEXT ${hintFor(`${r.verdict} ${detail}`, r.next)}`}${await tail()}` };
       }
       case 'type': {
         const pre = await preciseClick(page, target as string, { session: input.session, settleMs: 150 });
         if (!pre.clicked) return { ok: false, text: `ERR type ${target} -> ${pre.verdict}\nNEXT ${hintFor(`${pre.verdict} ${pre.covered_by ? 'covered by' : ''}`, pre.next)}${await tail()}` };
-        await page.typeText(target as string, input.text as string);
-        if (input.submit) await page.pressKey('Enter');
+        let how = '';
+        try {
+          await page.typeText(target as string, input.text as string);
+        } catch (err) {
+          if (!isHidden(err)) throw err;
+          const typed = await page.evaluate(domTypeJs(input.text as string));
+          if (typed !== true) throw err;
+          how = ' via dom (hidden tab, untrusted)';
+        }
+        if (input.submit) how += await pressKeyAnyway(page, 'Enter');
         await sleep(input.submit ? 400 : 100);
-        return { ok: true, text: `OK type ${target} (${(input.text as string).length} chars${input.submit ? ', Enter' : ''}) ${ms()}${await tail()}` };
+        return { ok: true, text: `OK type ${target} (${(input.text as string).length} chars${input.submit ? ', Enter' : ''})${how} ${ms()}${await tail()}` };
       }
       case 'key': {
-        await page.pressKey(input.key as string);
+        const how = await pressKeyAnyway(page, input.key as string);
         await sleep(250);
-        return { ok: true, text: `OK key ${input.key} ${ms()}${await tail()}` };
+        return { ok: true, text: `OK key ${input.key}${how} ${ms()}${await tail()}` };
       }
       case 'upload': {
         const r = await smartUpload(page, input.files as string[], {
           target, clipboard: input.clipboard, convert: input.convert, maxPx: input.max_px,
         });
         const ok = r.verdict === 'PASS';
-        return { ok, text: `${ok ? 'OK' : 'ERR'} upload ${describeUpload(r)} ${ms()}${ok ? '' : `\nNEXT ${r.next}`}${await tail()}` };
+        lastUploadDetail = describeUpload(r);
+        return { ok, text: `${ok ? 'OK' : 'ERR'} upload ${uploadLine(r)} ${ms()}${ok ? '' : `\nNEXT ${r.next}`}${await tail()}` };
       }
       case 'wait': {
         const limit = Math.min(Math.max(input.seconds ?? 30, 0), 300) * 1000;
@@ -355,7 +429,7 @@ async function actInner(page: IPage, input: ActInput, opts: { screen?: boolean }
         return { ok: true, text: `OK save ${out} (${fs.statSync(out).size} bytes) ${ms()}` };
       }
       case 'shot': {
-        const out = path.resolve((input.path ?? path.join(os.tmpdir(), `aira-shot-${Date.now()}.png`)).replace(/^~(?=\/)/, os.homedir()));
+        const out = shotPath(input.path);
         fs.mkdirSync(path.dirname(out), { recursive: true });
         const capture = (page.annotatedScreenshot ?? page.screenshot).bind(page);
         const b64 = await capture({ format: 'png', path: out });
@@ -364,8 +438,18 @@ async function actInner(page: IPage, input: ActInput, opts: { screen?: boolean }
       }
       case 'help':
         return { ok: true, text: PLAYBOOK };
-      case 'debug':
-        return { ok: true, text: readLog(input.max ?? 10) };
+      case 'debug': {
+        // Live state first, so the answer is more than a replay of the last error.
+        let state = 'STATE unknown (page did not answer)';
+        try {
+          const s = await page.evaluate(`({ v: document.visibilityState, f: document.hasFocus(), u: location.href, r: document.readyState })`) as { v: string; f: boolean; u: string; r: string };
+          state = `STATE tab ${s.v}${s.f ? ', focused' : ''}, ${s.r} | ${s.u.slice(0, 120)}\n`
+            + (s.v === 'visible'
+              ? 'INPUT trusted clicks and typing reach this tab.'
+              : 'INPUT tab is hidden: act activates it before input; when that fails it clicks and types inside the page (untrusted, marked "via dom"). Nothing for you to do; if a site ignores it, do=open the url again.');
+        } catch { /* keep the default line */ }
+        return { ok: true, text: `${state}${lastUploadDetail ? `\nLAST UPLOAD ${lastUploadDetail}` : ''}\n${readLog(input.max ?? 10)}` };
+      }
       default:
         return fail(`unknown verb ${String(input.do)}`, `Use one of: ${VERBS.join(', ')}`);
     }

@@ -296,11 +296,13 @@ export async function getBrowserPage(
 function getBrowserWindowMode(command: Command | undefined, defaultMode: BrowserWindowMode): BrowserWindowMode {
   const optionRaw = getCommandOption(command, 'window');
   if (optionRaw !== undefined && optionRaw !== '') {
+    if (optionRaw === 'foreground') process.env.OPENCLI_RAISE_WINDOW = '1';
     if (optionRaw === 'foreground' || optionRaw === 'background') return optionRaw;
     throw new Error(`--window must be one of: foreground, background. Received: "${String(optionRaw)}"`);
   }
   const envRaw = process.env.OPENCLI_WINDOW;
   if (envRaw !== undefined && envRaw !== '') {
+    if (envRaw === 'foreground') process.env.OPENCLI_RAISE_WINDOW = '1';
     if (envRaw === 'foreground' || envRaw === 'background') return envRaw;
     throw new Error(`OPENCLI_WINDOW must be one of: foreground, background. Received: "${envRaw}"`);
   }

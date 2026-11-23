@@ -19,6 +19,34 @@ import { CDPBasePage, NativeInputVisibilityError } from './base-page.js';
 import { classifyBrowserError } from './errors.js';
 import { CommandExecutionError } from '../errors.js';
 import { log } from '../logger.js';
+import { execFile } from 'node:child_process';
+
+function runQuiet(cmd: string, args: string[], timeout = 4000): Promise<boolean> {
+  return new Promise((resolve) => {
+    execFile(cmd, args, { timeout }, (err) => resolve(!err));
+  });
+}
+
+/** AppleScript: raise the Chrome window whose active tab shows this URL, then bring Chrome forward. */
+function raiseChromeWindowScript(app: string, url: string): string {
+  const q = (s: string) => `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  return [
+    `tell application ${q(app)}`,
+    '  repeat with w in windows',
+    '    try',
+    `      if URL of active tab of w is ${q(url)} then`,
+    '        try',
+    '          set minimized of w to false',
+    '        end try',
+    '        set index of w to 1',
+    '        exit repeat',
+    '      end if',
+    '    end try',
+    '  end repeat',
+    '  activate',
+    'end tell',
+  ].join('\n');
+}
 
 function isUnsupportedNetworkCaptureError(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err);
@@ -250,6 +278,68 @@ export class Page extends CDPBasePage {
       this._page = undefined;
       this._lastUrl = null;
     }
+  }
+
+  /**
+   * Trusted input only reaches a page the browser treats as visible. On a
+   * hidden tab, in this order:
+   *   1. activate the session's tab in its window;
+   *   2. focus emulation through the debugger (when the extension allows it);
+   *   3. raise the browser window (macOS), only when OPENCLI_RAISE_WINDOW=1
+   *      (set by the MCP server and by an explicit `--window foreground`);
+   *   4. otherwise throw, and the caller falls back to an in-page (untrusted) action.
+   */
+  private _focusEmulated = false;
+  private static _focusRefused = false;
+
+  protected override async assertNativeInputVisible(): Promise<void> {
+    const visible = async (): Promise<boolean> => {
+      try { return (await this.evaluate('document.visibilityState')) === 'visible'; } catch { return false; }
+    };
+    const waitVisible = async (ms: number): Promise<boolean> => {
+      const end = Date.now() + ms;
+      do {
+        if (await visible()) return true;
+        await new Promise((r) => setTimeout(r, 120));
+      } while (Date.now() < end);
+      return false;
+    };
+    if (await visible()) return;
+    if (this._focusEmulated) return;
+    const tried: string[] = [];
+    // 1. Make the session's tab the active tab of its window (no OS window change).
+    if (this._page) {
+      const keepUrl = this._lastUrl;
+      try { await this.selectTab(this._page); tried.push('activated the tab'); } catch { tried.push('could not activate the tab'); }
+      this._lastUrl = keepUrl;
+      if (await waitVisible(600)) return;
+    }
+    // 2. Focus emulation through the debugger (needs an extension that allows it).
+    if (!Page._focusRefused) {
+      try {
+        await this.cdp('Emulation.setFocusEmulationEnabled', { enabled: true });
+        await this.cdp('Page.setWebLifecycleState', { state: 'active' });
+        this._focusEmulated = true;
+        return;
+      } catch {
+        Page._focusRefused = true;
+      }
+    }
+    if (Page._focusRefused) tried.push('focus emulation (the extension does not allow it)');
+    // 3. Raise the OS window only when asked for (MCP act, --window foreground).
+    if (process.env.OPENCLI_RAISE_WINDOW !== '1') throw new NativeInputVisibilityError(tried.join(', '));
+    if (process.platform === 'darwin') {
+      let url = '';
+      try { url = String(await this.evaluate('location.href')); } catch { /* raise without a url */ }
+      for (const app of ['Google Chrome', 'Chromium', 'Google Chrome Canary', 'Brave Browser', 'Microsoft Edge']) {
+        if (!(await runQuiet('pgrep', ['-x', app], 1500))) continue;
+        const scripted = await runQuiet('osascript', ['-e', raiseChromeWindowScript(app, url)]);
+        if (!scripted) await runQuiet('open', ['-a', app]);
+        tried.push(scripted ? `raised the ${app} window` : `brought ${app} forward (window not raised: allow Automation for this terminal in System Settings > Privacy)`);
+        if (await waitVisible(2500)) return;
+      }
+    }
+    throw new NativeInputVisibilityError(tried.join(', ') || 'nothing (no tab id)');
   }
 
   async selectTab(target: number | string): Promise<void> {

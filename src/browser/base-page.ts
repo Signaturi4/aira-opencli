@@ -43,9 +43,11 @@ import { cdpKeyPressEvents, keyModifierFlags } from './key-definitions.js';
 export const NATIVE_INPUT_VISIBILITY_JS = 'document.visibilityState';
 
 export class NativeInputVisibilityError extends CommandExecutionError {
-  constructor() {
+  constructor(tried?: string) {
     super('Native input requires a visible browser page; input was not dispatched.',
-      'Select the target tab and restore/uncover its browser window, then retry.');
+      tried
+        ? `Tried: ${tried}. The page is still hidden. Bring the Chrome window with the automation tab to the front (un-minimize it, leave full-screen apps), then retry.`
+        : 'Select the target tab and restore/uncover its browser window, then retry.');
   }
 }
 

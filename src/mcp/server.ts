@@ -83,7 +83,11 @@ export function createMcpHandler(deps: McpServerDeps) {
     const session = input.session?.trim() || 'main';
     // help and debug must work even when the browser is unreachable.
     if (!('steps' in input) && input.do === 'help') return { ok: true, text: PLAYBOOK };
-    if (!('steps' in input) && input.do === 'debug') return { ok: true, text: readLog(input.max ?? 10) };
+    if (!('steps' in input) && input.do === 'debug') {
+      const open = pages.get(session);
+      if (!open) return { ok: true, text: `STATE no page is open in session "${session}" from this server (do=open first)\n${readLog(input.max ?? 10)}` };
+      return act(open, { ...input, session });
+    }
     let page = pages.get(session);
     if (!page) {
       try {

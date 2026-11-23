@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { IPage } from '../types.js';
 import { diffFingerprints, parsePoint, preciseClick, type PreciseTargetsResult } from '../browser/precise.js';
-import { parseActInput, resolveLabel } from './actions.js';
+import { parseActInput, resolveLabel, shotPath, uploadLine } from './actions.js';
+import { NativeInputVisibilityError } from '../browser/base-page.js';
 import { acceptAllows, describeUpload, mimeOf, smartUpload } from '../browser/upload.js';
 import { renderScreen } from './screen.js';
 import { ACT_TOOL, createMcpHandler } from './server.js';
@@ -138,6 +139,50 @@ describe('act input', () => {
     expect(await resolveLabel(fakePage([two]), 'Save')).toBe('1');
     const dup = { ...MAP, targets: [target(1, 'button', 'Save draft'), target(2, 'button', 'Save as')] };
     expect(await resolveLabel(fakePage([dup]), 'Save')).toMatchObject({ error: expect.stringContaining('2 options match') });
+  });
+});
+
+describe('agent-proofing', () => {
+  it('picks the visible, uncovered, topmost option when several share the exact name', async () => {
+    const dup = { ...MAP, targets: [
+      target(4, 'button', 'New chat', { in_viewport: false }),
+      target(7, 'button', 'New chat', { covered_by: 'div.menu' }),
+      target(9, 'button', 'New chat'),
+      target(8, 'button', 'New chat'),
+    ] };
+    expect(await resolveLabel(fakePage([dup]), 'New chat')).toBe('8');
+    const hidden = { ...MAP, targets: [target(4, 'button', 'New chat', { in_viewport: false }), target(5, 'button', 'New chat', { in_viewport: false })] };
+    expect(await resolveLabel(fakePage([hidden]), 'New chat')).toBe('4');
+  });
+
+  it('falls back to an in-page click on a hidden tab and says so', async () => {
+    const calls: string[] = [];
+    const page = fakePage([
+      { ok: true, matches_n: 1 },
+      { x: 50, y: 40, w: 80, h: 20, visible: true, hit: 'target' },
+      { x: 50, y: 40, found: true, element: 'button "Send"' },
+      'button "Send"',
+      fp(),
+      { ok: true },
+      fp({ text: '9:2', landing: { x: 50, y: 40, trusted: false, on: 'button "Send"', on_target: true } }),
+    ], calls);
+    (page as unknown as { nativeClick: unknown }).nativeClick = async () => { throw new NativeInputVisibilityError('activated the tab'); };
+    const r = await preciseClick(page, '3', { settleMs: 0 });
+    expect(r.verdict).toBe('PASS');
+    expect(r.click_method).toBe('dom');
+    expect(r.trusted).toBe(false);
+  });
+
+  it('prints only the verdict and count for a successful upload', () => {
+    const ok = { verdict: 'PASS', strategy: 'capture', files: ['/a.png', '/b.png'], evidence: 'image previews +4', attempts: [{ strategy: 'input', ok: false, detail: 'Chrome refused' }], next: '' };
+    expect(uploadLine(ok as never)).toBe('PASS attached 2 of 2');
+    const bad = { ...ok, verdict: 'FAILED', strategy: undefined };
+    expect(uploadLine(bad as never)).toContain('input: no - Chrome refused');
+  });
+
+  it('saves screenshots where the agent can read them', () => {
+    expect(shotPath(undefined)).toMatch(/aira-mcp[\\/]shots[\\/]shot-.*\.png$/);
+    expect(shotPath('/x/y.png')).toBe('/x/y.png');
   });
 });
 

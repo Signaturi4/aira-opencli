@@ -154,6 +154,8 @@ export function createProgram(BUILTIN_CLIS: string, USER_CLIS: string): Command 
       const globals = command.optsWithGlobals() as { profile?: string };
       const profileSelection = resolveProfileSelection(typeof globals.profile === 'string' ? globals.profile : undefined);
       const windowMode = opts.window === 'foreground' ? 'foreground' : 'background';
+      // Agents cannot fix a hidden tab themselves: let native input raise the browser window when needed.
+      if (process.env.OPENCLI_NO_RAISE !== '1') process.env.OPENCLI_RAISE_WINDOW = '1';
       await serveMcpStdio({
         version: PKG_VERSION,
         getPage: (session) => getBrowserPage(session, undefined, profileSelection, { windowMode }),

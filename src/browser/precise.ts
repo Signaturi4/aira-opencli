@@ -23,6 +23,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import type { IPage } from '../types.js';
+import { NativeInputVisibilityError } from './base-page.js';
 import { boundingRectResolvedJs, resolveTargetJs, type ResolveOptions } from './target-resolver.js';
 
 export type PreciseVerdict =
@@ -107,6 +108,9 @@ export interface PreciseClickResult {
   point?: { x: number; y: number };
   aimed_at?: string;
   landed_on?: string;
+  /** cdp = trusted browser-level click; dom = in-page events + el.click() on a hidden tab (untrusted). */
+  click_method?: 'cdp' | 'dom';
+  trusted?: boolean;
   hit?: string;
   covered_by?: string;
   changed?: string[];
@@ -382,6 +386,28 @@ export async function preciseAt(page: IPage, x: number, y: number): Promise<Prec
   };
 }
 
+/** Page-side: an untrusted click at a point, for hidden tabs where trusted input cannot be delivered. */
+export function domClickJs(x: number, y: number): string {
+  return `
+    (() => {
+      const el = document.elementFromPoint(${x}, ${y});
+      if (!el) return { ok: false };
+      const init = { bubbles: true, cancelable: true, composed: true, view: window, clientX: ${x}, clientY: ${y}, button: 0, buttons: 1 };
+      const ptr = { ...init, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+      el.dispatchEvent(new PointerEvent('pointerover', ptr));
+      el.dispatchEvent(new MouseEvent('mouseover', init));
+      el.dispatchEvent(new PointerEvent('pointerdown', ptr));
+      el.dispatchEvent(new MouseEvent('mousedown', init));
+      const focusable = el.closest('a,button,input,textarea,select,[tabindex],[contenteditable]');
+      if (focusable && focusable.focus) focusable.focus();
+      el.dispatchEvent(new PointerEvent('pointerup', { ...ptr, buttons: 0 }));
+      el.dispatchEvent(new MouseEvent('mouseup', { ...init, buttons: 0 }));
+      el.click();
+      return { ok: true };
+    })()
+  `;
+}
+
 /** Aim, pre-check, one trusted click, verify. Never throws for a refusal. */
 export async function preciseClick(page: IPage, target: string, opts: PreciseClickOptions = {}): Promise<PreciseClickResult> {
   const force = opts.force === true;
@@ -437,7 +463,16 @@ export async function preciseClick(page: IPage, target: string, opts: PreciseCli
   }
 
   const before = await page.evaluate(fingerprintJs(true)) as Fingerprint;
-  await page.nativeClick(point.x, point.y);
+  let clickMethod: 'cdp' | 'dom' = 'cdp';
+  try {
+    await page.nativeClick(point.x, point.y);
+  } catch (err) {
+    if (!(err instanceof NativeInputVisibilityError) && !/Native input requires a visible/i.test(String((err as Error)?.message))) throw err;
+    // Hidden tab and no way to deliver trusted input: click inside the page instead.
+    const done = await page.evaluate(domClickJs(point.x, point.y)) as { ok: boolean } | undefined;
+    if (!done?.ok) throw err;
+    clickMethod = 'dom';
+  }
   await sleep(Math.max(0, opts.settleMs ?? 350));
 
   let after: Fingerprint;
@@ -464,7 +499,7 @@ export async function preciseClick(page: IPage, target: string, opts: PreciseCli
   }
 
   const base = {
-    clicked: true, target, point, aimed_at: aimedAt, hit, changed, matches_n: matchesN,
+    clicked: true, click_method: clickMethod, trusted: clickMethod === 'cdp', target, point, aimed_at: aimedAt, hit, changed, matches_n: matchesN,
     ...(landing ? { landed_on: landing.on } : {}),
     ...(expect ? { expect } : {}),
   };
