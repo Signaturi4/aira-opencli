@@ -10,6 +10,8 @@
  * the protocol surface used here is four methods.
  */
 
+import { foregroundStatus, holdsTask, releaseForeground, startTask, takeWaitNote } from '../browser/foreground.js';
+import { describeForeground, type FgStatusLane } from '../foreground-queue.js';
 import * as readline from 'node:readline';
 import type { IPage } from '../types.js';
 import { hintFor, logEvent, PLAYBOOK, readLog } from './troubleshoot.js';
@@ -53,6 +55,13 @@ export const ACT_TOOL = {
       expect: { type: 'string', description: 'click: JS expression that must be truthy afterwards.' },
       force: { type: 'boolean', description: 'click: click even when covered. Use on purpose only.' },
       max: { type: 'number', description: 'Maximum option lines (default 40).' },
+      lease: { type: 'string', enum: ['task'], description: 'Keep the visible tab for this session across calls (multi-step task). End with do=done.' },
+      limit: { type: 'number', description: 'each: stop after this many items.' },
+      min_interval_ms: { type: 'number', description: 'each: minimum ms between items (default 300).' },
+      time_budget: { type: 'number', description: 'each: seconds this call may run (default 100). Continue with resume=true.' },
+      resume: { type: 'boolean', description: 'each: continue the previous run.' },
+      save: { type: 'string', description: 'each: file for the full data (JSON lines).' },
+      rediscover: { type: 'boolean', description: 'each: ignore the cached recipe.' },
       steps: { type: 'array', maxItems: 20, items: { type: 'object' }, description: 'A plan: several actions (same fields as above) run in order in one call. Use instead of `do`.' },
     },
     additionalProperties: false,
@@ -61,6 +70,8 @@ export const ACT_TOOL = {
 
 export interface McpServerDeps {
   getPage(session: string): Promise<IPage>;
+  /** Profile route for queue calls that have no page yet. */
+  route?: { contextId?: string; preferredContextId?: string };
   version: string;
   log?(line: string): void;
 }
@@ -83,6 +94,13 @@ export function createMcpHandler(deps: McpServerDeps) {
     const session = input.session?.trim() || 'main';
     // help and debug must work even when the browser is unreachable.
     if (!('steps' in input) && input.do === 'help') return { ok: true, text: PLAYBOOK };
+    if (!('steps' in input) && input.do === 'queue') {
+      return { ok: true, text: describeForeground(await foregroundStatus({ session, ...deps.route }) as FgStatusLane[]) };
+    }
+    if (!('steps' in input) && input.do === 'done') {
+      const released = await releaseForeground(session, { force: true, route: { session, ...deps.route } });
+      return { ok: true, text: `OK done: ${released ? `session "${session}" gave the visible tab back` : `session "${session}" held nothing`}` };
+    }
     if (!('steps' in input) && input.do === 'debug') {
       const open = pages.get(session);
       if (!open) return { ok: true, text: `STATE no page is open in session "${session}" from this server (do=open first)\n${readLog(input.max ?? 10)}` };
@@ -98,9 +116,24 @@ export function createMcpHandler(deps: McpServerDeps) {
         return { ok: false, text: `ERR cannot reach the browser: ${message}\nNEXT ${hintFor(`not connected ${message}`)}` };
       }
     }
-    const out = 'steps' in input
-      ? await actSteps(page, input.steps, { session, max: input.max })
-      : await act(page, { ...input, session });
+    let out: { ok: boolean; text: string };
+    try {
+      if (!('steps' in input) && input.lease === 'task') await startTask({ session, ...deps.route });
+      out = 'steps' in input
+        ? await actSteps(page, input.steps, { session, max: input.max })
+        : await act(page, { ...input, session });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      out = { ok: false, text: `ERR ${message}\nNEXT ${hintFor(message)}` };
+    } finally {
+      // One action or plan per lease; a task lease stays until do=done.
+      await releaseForeground(session);
+    }
+    const waited = takeWaitNote();
+    const lines = out.text.split('\n');
+    if (waited) lines[0] += ` (${waited})`;
+    if (holdsTask(session)) lines[0] += ' [task lease held: end with do=done]';
+    out = { ok: out.ok, text: lines.join('\n') };
     // A failed step may mean the page object went stale; reconnect on the next call.
     if (!out.ok && /failed:/.test(out.text)) pages.delete(session);
     return out;

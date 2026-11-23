@@ -9,6 +9,7 @@
  * page-scoped operations target the correct page without guessing.
  */
 
+import { ensureForeground } from './foreground.js';
 import type { BrowserCookie, BrowserDownloadWaitResult, BrowserEvaluateFunction, ScreenshotOptions } from '../types.js';
 import { sendCommand, sendCommandFull } from './daemon-client.js';
 import { buildEvaluateExpression } from './utils.js';
@@ -281,18 +282,24 @@ export class Page extends CDPBasePage {
   }
 
   /**
-   * Trusted input only reaches a page the browser treats as visible. On a
-   * hidden tab, in this order:
-   *   1. activate the session's tab in its window;
-   *   2. focus emulation through the debugger (when the extension allows it);
-   *   3. raise the browser window (macOS), only when OPENCLI_RAISE_WINDOW=1
-   *      (set by the MCP server and by an explicit `--window foreground`);
-   *   4. otherwise throw, and the caller falls back to an in-page (untrusted) action.
+   * Called before every native input (AIRA).
+   *
+   * Measured on macOS, Chrome + extension 1.0.27: a page reports hidden when
+   * its tab is not the active one OR when another app covers the whole Chrome
+   * window. On a hidden page CDP mouse events are not reliable (lost on an
+   * inactive tab, about 2 s per event when they do arrive), key events are
+   * dropped, inserted text arrives. So:
+   *   1. take our turn in the foreground queue;
+   *   2. visible: trusted input as usual (returns false);
+   *   3. hidden and the window was asked for by name (`--window foreground`,
+   *      OPENCLI_RAISE_WINDOW=1): activate the tab, raise the window, re-check;
+   *   4. still hidden: mouse input throws, and the caller clicks inside the
+   *      page instead (untrusted, reported as click_method "dom"); text and
+   *      keys go on and return true, callers verify or fall back themselves.
+   * Nothing is brought to the front by default.
    */
-  private _focusEmulated = false;
-  private static _focusRefused = false;
-
-  protected override async assertNativeInputVisible(): Promise<void> {
+  protected override async assertNativeInputVisible(kind?: 'mouse' | 'keys'): Promise<boolean> {
+    await ensureForeground({ session: this.session, contextId: this.contextId, preferredContextId: this.preferredContextId });
     const visible = async (): Promise<boolean> => {
       try { return (await this.evaluate('document.visibilityState')) === 'visible'; } catch { return false; }
     };
@@ -304,30 +311,20 @@ export class Page extends CDPBasePage {
       } while (Date.now() < end);
       return false;
     };
-    if (await visible()) return;
-    if (this._focusEmulated) return;
+    if (await visible()) return false;
+    const strict = process.env.OPENCLI_INPUT_GUARD === 'strict';
+    const giveUp = (tried: string): boolean => {
+      if (strict || kind === 'mouse') throw new NativeInputVisibilityError(tried);
+      return true;
+    };
+    if (process.env.OPENCLI_RAISE_WINDOW !== '1') return giveUp('nothing: the page is hidden and the window was not asked to come forward');
     const tried: string[] = [];
-    // 1. Make the session's tab the active tab of its window (no OS window change).
     if (this._page) {
       const keepUrl = this._lastUrl;
       try { await this.selectTab(this._page); tried.push('activated the tab'); } catch { tried.push('could not activate the tab'); }
       this._lastUrl = keepUrl;
-      if (await waitVisible(600)) return;
+      if (await waitVisible(600)) return false;
     }
-    // 2. Focus emulation through the debugger (needs an extension that allows it).
-    if (!Page._focusRefused) {
-      try {
-        await this.cdp('Emulation.setFocusEmulationEnabled', { enabled: true });
-        await this.cdp('Page.setWebLifecycleState', { state: 'active' });
-        this._focusEmulated = true;
-        return;
-      } catch {
-        Page._focusRefused = true;
-      }
-    }
-    if (Page._focusRefused) tried.push('focus emulation (the extension does not allow it)');
-    // 3. Raise the OS window only when asked for (MCP act, --window foreground).
-    if (process.env.OPENCLI_RAISE_WINDOW !== '1') throw new NativeInputVisibilityError(tried.join(', '));
     if (process.platform === 'darwin') {
       let url = '';
       try { url = String(await this.evaluate('location.href')); } catch { /* raise without a url */ }
@@ -336,10 +333,15 @@ export class Page extends CDPBasePage {
         const scripted = await runQuiet('osascript', ['-e', raiseChromeWindowScript(app, url)]);
         if (!scripted) await runQuiet('open', ['-a', app]);
         tried.push(scripted ? `raised the ${app} window` : `brought ${app} forward (window not raised: allow Automation for this terminal in System Settings > Privacy)`);
-        if (await waitVisible(2500)) return;
+        if (await waitVisible(2500)) return false;
       }
     }
-    throw new NativeInputVisibilityError(tried.join(', ') || 'nothing (no tab id)');
+    return giveUp(tried.join(', ') || 'nothing (no tab id)');
+  }
+
+  /** Public door to the foreground queue for actions that need the visible tab but send no input (screenshot). */
+  async takeForeground(command = 'input'): Promise<void> {
+    await ensureForeground({ session: this.session, contextId: this.contextId, preferredContextId: this.preferredContextId }, command);
   }
 
   async selectTab(target: number | string): Promise<void> {

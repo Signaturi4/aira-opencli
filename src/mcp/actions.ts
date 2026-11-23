@@ -20,7 +20,7 @@ import { describeUpload, smartUpload, type SmartUploadResult } from '../browser/
 import { renderScreen } from './screen.js';
 import { hintFor, PLAYBOOK, readLog } from './troubleshoot.js';
 
-export const VERBS = ['open', 'look', 'click', 'type', 'key', 'upload', 'wait', 'scroll', 'read', 'images', 'save', 'shot', 'help', 'debug'] as const;
+export const VERBS = ['open', 'look', 'click', 'type', 'key', 'upload', 'wait', 'scroll', 'read', 'images', 'save', 'shot', 'each', 'queue', 'done', 'help', 'debug'] as const;
 export type Verb = typeof VERBS[number];
 
 export interface ActInput {
@@ -56,6 +56,20 @@ export interface ActInput {
   force?: boolean;
   /** Maximum option lines in the answer (default 40). */
   max?: number;
+  /** "task": keep the foreground lease across calls until do=done (or 2 min without a call). */
+  lease?: 'task';
+  /** each: stop after this many items. */
+  limit?: number;
+  /** each: minimum milliseconds between two items (default 300). */
+  min_interval_ms?: number;
+  /** each: seconds this call may run (default 100); continue with resume=true. */
+  time_budget?: number;
+  /** each: continue the previous run instead of starting over. */
+  resume?: boolean;
+  /** each: file for the full data (JSON lines). */
+  save?: string;
+  /** each: ignore the cached recipe and discover the list again. */
+  rediscover?: boolean;
 }
 
 export interface ActPlan {
@@ -104,6 +118,11 @@ export function parseActInput(raw: unknown): ActInput | ActPlan | string {
   if (a.direction !== undefined && a.direction !== 'up' && a.direction !== 'down') return 'direction must be up or down';
   if (a.convert !== undefined && a.convert !== 'png' && a.convert !== 'jpeg') return 'convert must be png or jpeg';
   if (a.max_px !== undefined && !(typeof a.max_px === 'number' && a.max_px >= 16)) return 'max_px must be a number >= 16';
+  if (a.lease !== undefined && a.lease !== 'task') return 'lease must be "task"';
+  for (const k of ['limit', 'min_interval_ms', 'time_budget']) {
+    if (a[k] !== undefined && !(typeof a[k] === 'number' && (a[k] as number) >= 0)) return `${k} must be a number >= 0`;
+  }
+  if (a.save !== undefined && a.do === 'each' && typeof a.save !== 'string') return 'save must be a file path';
   const need = (k: string) => (a[k] === undefined || a[k] === '' ? `do=${String(a.do)} needs ${k}` : null);
   const required: Record<string, string[]> = {
     open: ['url'], click: ['target'], type: ['target', 'text'], key: ['key'], upload: ['files'], save: ['target'],
@@ -206,6 +225,18 @@ function readJs(target: string | undefined, limit: number): string {
  */
 let lastUploadDetail = '';
 
+/** Why a page reports hidden: its tab is not the active one, or the whole window is covered / minimised. */
+async function hiddenWhy(page: IPage): Promise<string> {
+  try {
+    const tabs = await (page as unknown as { tabs?: () => Promise<Array<{ active?: boolean; url?: string }>> }).tabs?.();
+    const url = String(await page.evaluate('location.href'));
+    const mine = tabs?.find((t) => t.url === url);
+    if (mine && mine.active === false) return 'tab inactive: another tab is in front in its Chrome window';
+    if (mine && mine.active === true) return 'window occluded: the tab is active but another app covers the Chrome window, or the window is minimised';
+  } catch { /* fall through */ }
+  return 'tab inactive, or the Chrome window is covered by another app or minimised';
+}
+
 /** Upload answer for the agent: verdict and count on success, the per-strategy lines only on failure. */
 export function uploadLine(r: SmartUploadResult): string {
   return r.verdict === 'PASS' ? `PASS attached ${r.files.length} of ${r.files.length}` : describeUpload(r);
@@ -243,9 +274,24 @@ function domTypeJs(text: string): string {
 
 /** Trusted key press, or on a hidden tab an in-page key event (untrusted; some sites ignore it). */
 async function pressKeyAnyway(page: IPage, key: string): Promise<string> {
+  // Chrome drops trusted key events on a hidden page: watch whether the key arrives.
+  let hidden = false;
+  try {
+    hidden = await page.evaluate(`(() => {
+      if (document.visibilityState === 'visible') return false;
+      window.__airaKey = 0;
+      window.addEventListener('keydown', (e) => { if (e.isTrusted) window.__airaKey = 1; }, { capture: true, once: true });
+      return true;
+    })()`) === true;
+  } catch { /* treat as visible */ }
   try {
     await page.pressKey(key);
-    return '';
+    if (!hidden) return '';
+    for (let i = 0; i < 4; i++) {
+      if (await page.evaluate('window.__airaKey === 1')) return ' (hidden page)';
+      await sleep(80);
+    }
+    throw new Error('Native input requires a visible browser page; the key did not arrive.');
   } catch (err) {
     if (!isHidden(err)) throw err;
     await page.evaluate(`
@@ -258,7 +304,7 @@ async function pressKeyAnyway(page: IPage, key: string): Promise<string> {
         el.dispatchEvent(new KeyboardEvent('keyup', init));
       })()
     `);
-    return ' via dom key event (hidden tab, untrusted)';
+    return ' via dom key event (hidden page: the site\'s own key handlers run, built-in effects such as deleting text or submitting a form do not; click the button instead)';
   }
 }
 
@@ -350,7 +396,7 @@ async function actInner(page: IPage, input: ActInput, opts: { screen?: boolean }
           r.verdict === 'MISSED' && r.landed_on ? `landed on ${r.landed_on}` : '',
           r.message ?? '',
         ].filter(Boolean).join('; ');
-        const via = r.click_method === 'dom' ? ' via dom (hidden tab, untrusted)' : '';
+        const via = r.click_method === 'dom' ? ' via dom (hidden page, untrusted)' : '';
         const head = `${good ? 'OK' : 'ERR'} click ${target} -> ${r.verdict}${via}${detail ? ` (${detail})` : ''} ${ms()}`;
         return { ok: good, text: `${head}${r.verdict === 'PASS' ? '' : `\nNEXT ${hintFor(`${r.verdict} ${detail}`, r.next)}`}${await tail()}` };
       }
@@ -430,6 +476,7 @@ async function actInner(page: IPage, input: ActInput, opts: { screen?: boolean }
       }
       case 'shot': {
         const out = shotPath(input.path);
+        await (page as unknown as { takeForeground?: (c: string) => Promise<void> }).takeForeground?.('shot');
         fs.mkdirSync(path.dirname(out), { recursive: true });
         const capture = (page.annotatedScreenshot ?? page.screenshot).bind(page);
         const b64 = await capture({ format: 'png', path: out });
@@ -446,7 +493,7 @@ async function actInner(page: IPage, input: ActInput, opts: { screen?: boolean }
           state = `STATE tab ${s.v}${s.f ? ', focused' : ''}, ${s.r} | ${s.u.slice(0, 120)}\n`
             + (s.v === 'visible'
               ? 'INPUT trusted clicks and typing reach this tab.'
-              : 'INPUT tab is hidden: act activates it before input; when that fails it clicks and types inside the page (untrusted, marked "via dom"). Nothing for you to do; if a site ignores it, do=open the url again.');
+              : `INPUT page is hidden (${await hiddenWhy(page)}). Nothing is brought to the front. Clicks run inside the page ("via dom", untrusted, still verified); typed text arrives; keys are sent as in-page events, so click the Send/OK button instead of pressing Enter. If a site insists on a real click, the user can start the server with --window foreground.`);
         } catch { /* keep the default line */ }
         return { ok: true, text: `${state}${lastUploadDetail ? `\nLAST UPLOAD ${lastUploadDetail}` : ''}\n${readLog(input.max ?? 10)}` };
       }

@@ -29,7 +29,8 @@ const RULES: Rule[] = [
   { when: /REFUSED_NOT_VISIBLE/i, next: 'The target has no visible box. Open the menu or section that contains it, or do=scroll, then do=look for a fresh ref.' },
   { when: /NOT_FOUND|no option labelled|not found/i, next: 'The ref or label no longer exists. Call do=look (optionally with find) and use a ref from the new OPTIONS.' },
   { when: /options match/i, next: 'The label is ambiguous. Use the ref number, or label:<role>:<exact name>.' },
-  { when: /Native input requires a visible/i, next: 'The tab is hidden and could not be activated. Call do=open with the same url (it re-creates the tab), then repeat the step once; if it fails again, stop and tell the user to bring the Chrome window to the front.' },
+  { when: /Native input requires a visible/i, next: 'The page is hidden (tab inactive or window covered) and the strict input guard is on. Call do=debug to see which; ask the user to unset OPENCLI_INPUT_GUARD or bring the Chrome window to the front.' },
+  { when: /Foreground busy/i, next: 'Another session is using the visible tab. Call do=queue to see who; wait a few seconds and repeat the step once. If the holder is a finished task, do=done with its session name frees it.' },
   { when: /MISSED/i, next: 'Another element took the click. Call do=look, close what is in the way, then click the ref again once.' },
   { when: /NO_CHANGE/i, next: 'The click landed but nothing changed. The control may need hover or focus first, or the page is still busy: do=wait seconds=1, then do=look.' },
   { when: /file not found/i, next: 'Pass absolute paths of files that exist on this machine.' },
@@ -56,6 +57,8 @@ export const PLAYBOOK = [
   '5. Long work (generation, upload): do=wait with until / gone / selector, never a fixed sleep.',
   '6. Result files: do=images then do=save target=<index> path=<file>.',
   '',
+  'QUEUE',
+  'Only one session per Chrome profile uses the visible tab at a time (click, type, key, upload, shot). Others wait in line; the result then says "waited 3.2 s for session X". look, read, wait, images and each never wait. For a multi-step task that must not be interleaved, add lease="task" to the first call and finish with do=done. do=queue shows holder and waiters.',
   'WHEN IT FAILS',
   '- ERR … covered by X      → do=key key=Escape, or close X, then click once more.',
   '- ERR … NOT_FOUND / label → do=look find=<word>, use the new ref.',
@@ -66,7 +69,7 @@ export const PLAYBOOK = [
   '- OPTIONS is empty        → the page is loading: do=wait selector=<css> or seconds=2.',
   '- Wrong page / tab gone   → do=open again.',
   '- Screenshots are rarely needed: OPTIONS already lists what can be clicked and do=read gives the text. do=shot saves a PNG under ~/.opencli/aira-mcp/shots/ and prints the path.',
-  '- "via dom" in a result → the tab was hidden, so the action ran inside the page; it worked unless the verdict says otherwise.',
+  '- Hidden page (Chrome covered by another app, or tab not active): nothing is brought to the front. Clicks run inside the page and are marked "via dom"; typing works; real key presses are not delivered, so click the Send/OK button instead of pressing Enter.',
   '- Same error twice        → do=debug, report the last lines to the user; do not loop.',
 ].join('\n');
 

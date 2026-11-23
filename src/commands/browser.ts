@@ -11,6 +11,8 @@ import { DEFAULT_TTL_MS, findEntry, loadNetworkCache, saveNetworkCache, type Cac
 import { NETWORK_INTERCEPTOR_JS } from '../browser/network-interceptor.js';
 import { assignKeys } from '../browser/network-key.js';
 import { sanitizeCapturedRequest, sanitizeCapturedUrl, type SafeNetworkRequest } from '../browser/network-request.js';
+import { foregroundStatus, releaseAllForeground, releaseForeground, takeWaitNote } from '../browser/foreground.js';
+import { describeForeground, type FgStatusLane } from '../foreground-queue.js';
 import { profileRouteParams, resolveProfileSelection, type ProfileSelection } from '../browser/profile.js';
 import { preciseAt, preciseClick, preciseTargets, readPreciseLog } from '../browser/precise.js';
 import { smartUpload, type UploadStrategy } from '../browser/upload.js';
@@ -551,6 +553,11 @@ export function registerBrowserCommands(program: Command): Command {
       } catch (err) {
         if (isJavaScriptDialogMessage(getErrorMessage(err))) emitJavaScriptDialogError(getErrorMessage(err));
         else emitFailure(err);
+      } finally {
+        // Give the visible tab back to the next session in line.
+        await releaseAllForeground().catch(() => undefined);
+        const waited = takeWaitNote();
+        if (waited) process.stderr.write(`[queue] ${waited}\n`);
       }
     });
   }
@@ -1499,6 +1506,22 @@ export function registerBrowserCommands(program: Command): Command {
       });
       emitResult(result);
       if (result.verdict !== 'PASS') process.exitCode = EXIT_CODES.GENERIC_ERROR;
+    }));
+
+  browser.command('queue')
+    .option('--release <session>', 'Free the visible tab held by this session (a finished task lease)')
+    .description('Foreground queue: which session holds the visible tab, who waits, for how long')
+    .action(browserLifecycle(async (opts: { release?: string }, command: Command) => {
+      try {
+        const route = profileRouteParams(getBrowserProfileSelection(command));
+        if (opts.release) {
+          const released = await releaseForeground(opts.release, { force: true, route: { session: opts.release, ...route } });
+          emitResult({ released, session: opts.release });
+          return;
+        }
+        const lanes = await foregroundStatus({ ...route }) as FgStatusLane[];
+        emitResult({ lanes, text: describeForeground(lanes) });
+      } catch (err) { emitFailure(err); }
     }));
 
   browser.command('pclick-log')

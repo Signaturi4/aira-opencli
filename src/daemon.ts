@@ -48,6 +48,7 @@ import {
   getSessionLeaseKey,
   isSessionLeaseCommand,
 } from './session-lease.js';
+import { ForegroundQueue } from './foreground-queue.js';
 import { SLOT_WAIT_DEFAULT_MS, SiteSlotScheduler, SlotAdmission, parseSlotPolicy, validSlotWaitMs } from './site-slots.js';
 
 const PORT = DEFAULT_DAEMON_PORT;
@@ -150,6 +151,9 @@ const sessionLeases = new SessionLeaseRegistry();
 
 // Per-(contextId, site) slot pools with a cancellable admission queue
 // (site-slots.ts). A queued slot-acquire is an open HTTP request.
+// AIRA: one FIFO lane per profile for anything that needs the visible tab.
+const foregroundQueue = new ForegroundQueue();
+
 const slotAdmission = new SlotAdmission({
   scheduler: new SiteSlotScheduler({ ttlMs: SESSION_LEASE_TTL_MS }),
   routeFailure: (contextId) => {
@@ -392,6 +396,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       pending: pending.size,
       sessionLeases: sessionLeases.list(Date.now(), runHasPendingWork),
       siteSlots: slotAdmission.list(),
+      foreground: foregroundQueue.status(),
       commandResultUnknown: commandResultUnknownCount,
       memoryMB: Math.round(mem.rss / 1024 / 1024 * 10) / 10,
       port: PORT,
@@ -482,6 +487,42 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         res.on('close', () => { if (!replied) cancel(); });
         return;
       }
+
+      // ─── Foreground queue (AIRA) ─────────────────────────────────────
+      // Daemon-local, per profile. fg-acquire stays open while the caller
+      // waits its turn; a caller that goes away is dequeued.
+      if (body.action === 'fg-acquire') {
+        if (typeof body.session !== 'string' || !body.session) {
+          jsonResponse(res, 400, { id: body.id, ok: false, error: 'fg-acquire needs session' });
+          return;
+        }
+        let replied = false;
+        const cancel = foregroundQueue.acquire(route.connection.contextId, {
+          session: body.session,
+          pid: Number(body.pid) || 0,
+          pidBound: body.pidBound === true,
+          mode: body.lease === 'task' ? 'task' : 'action',
+          command: typeof body.command === 'string' ? body.command.slice(0, 40) : 'input',
+          waitMs: typeof body.waitMs === 'number' ? body.waitMs : undefined,
+        }, (result) => {
+          replied = true;
+          if (result.ok) jsonResponse(res, 200, { id: body.id, ok: true, data: result });
+          else jsonResponse(res, 409, { id: body.id, ...result });
+        });
+        res.on('close', () => { if (!replied) cancel(); });
+        return;
+      }
+      if (body.action === 'fg-release') {
+        const released = typeof body.session === 'string' && foregroundQueue.release(route.connection.contextId, body.session);
+        jsonResponse(res, 200, { id: body.id, ok: true, data: { released } });
+        return;
+      }
+      if (body.action === 'fg-status') {
+        jsonResponse(res, 200, { id: body.id, ok: true, data: { lanes: foregroundQueue.status().filter((l) => l.profile === route.connection!.contextId) } });
+        return;
+      }
+      // Any command from the holding session keeps its lease alive.
+      foregroundQueue.touch(route.connection.contextId, typeof body.session === 'string' ? body.session : undefined);
 
       // Slot ownership: a holder's command refreshes its slot; a run that lost
       // its slot can no longer drive that tab.
