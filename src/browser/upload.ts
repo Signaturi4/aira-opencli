@@ -28,6 +28,7 @@ import * as path from 'node:path';
 import { promisify } from 'node:util';
 import type { IPage } from '../types.js';
 import { preciseClick, preciseTargets, type PreciseTarget } from './precise.js';
+import { isHiddenPage, pumpFrame } from './frame.js';
 
 const run = promisify(execFile);
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -503,6 +504,7 @@ export async function smartUpload(page: IPage, specs: string[], opts: SmartUploa
   already = Math.max(before.blobs, before.previews);
 
   expected = files.length;
+  const hidden = await isHiddenPage(page);
   let via = '';
   /** Native route first (real paths, any size); when Chrome or the extension refuses, set File objects in the page. */
   const setBatch = async (batch: string[]): Promise<void> => {
@@ -569,6 +571,7 @@ export async function smartUpload(page: IPage, specs: string[], opts: SmartUploa
                 let covered: PreciseTarget | undefined;
                 for (let wait = 0; wait < (depth === 0 ? 1 : 4) && !pick; wait++) {
                   if (wait) await sleep(300);
+                  if (hidden) await pumpFrame(page); // lets a menu animation advance
                   const map = await preciseTargets(page, {});
                   const fresh = (t: PreciseTarget) => !seenNames.has(t.name);
                   pick = uploadControls(map.targets, seen).filter(fresh)[0];

@@ -598,7 +598,7 @@ async function actInner(page: IPage, input: ActInput, opts: { screen?: boolean }
           limit: input.limit, minIntervalMs: input.min_interval_ms, timeBudgetS: input.time_budget,
           resume: input.resume, save: input.save, rediscover: input.rediscover,
         });
-        const text = `each ${describeEach(r, input.max ?? 25)}`;
+        const text = `each ${describeEach(r, input.max ?? (input.mode === 'list' ? 60 : 25))}`;
         return r.ok ? { ok: true, text: `OK ${text}\nNEXT ${r.next}` } : fail(text, r.next);
       }
       case 'help':

@@ -20,6 +20,11 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import type { IPage } from '../types.js';
+import { isHiddenPage, pumpFrame } from './frame.js';
+
+/** Set per run: the page is hidden, so frames are pumped after scrolls and clicks. */
+let hiddenRun = false;
+const frame = async (page: IPage): Promise<void> => { if (hiddenRun) await pumpFrame(page); };
 
 export interface EachRecipe {
   version: 1;
@@ -97,7 +102,7 @@ export interface EachTiming {
 
 export interface EachResult {
   ok: boolean;
-  verdict: 'DONE' | 'CUT_TIME' | 'CUT_LIMIT' | 'NO_LIST' | 'NO_DETAIL' | 'FAILED';
+  verdict: 'DONE' | 'CUT_TIME' | 'CUT_LIMIT' | 'CUT_BLANK' | 'NO_LIST' | 'NO_DETAIL' | 'FAILED';
   message?: string;
   recipe?: EachRecipe;
   recipe_source?: 'cached' | 'discovered';
@@ -124,7 +129,7 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
  * Plain JS in a raw string: no template placeholders, no backticks.
  */
 const PAGE_LIB = String.raw`
-if (!window.__ae || window.__ae.v !== 5) { window.__ae = (() => {
+if (!window.__ae || window.__ae.v !== 9) { window.__ae = (() => {
   const S = { seen: new Set(), last: 0, lastD: 0, n: 0, detailSel: '', marks: null, cur: null, keyMode: 'href', clickAt: 0, reqs: [], token: Math.random().toString(36).slice(2) };
   const now = () => performance.now();
   const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
@@ -346,6 +351,15 @@ if (!window.__ae || window.__ae.v !== 5) { window.__ae = (() => {
     };
   };
 
+  // Hidden page: rows are filled only when a frame is drawn, and older filled rows may sit far below.
+  // Read in order and stop at the first placeholder in or below the window, so nothing is skipped.
+  const rows = (r) => {
+    const all = qa(r.item);
+    if (document.visibilityState === 'visible') return all;
+    const out = [];
+    for (const it of all) { const b = box(it); if (b.height > 8 && b.bottom > 0 && clean(it.textContent).length < 2) break; out.push(it); }
+    return out;
+  };
   const verify = (r) => { S.keyMode = r.key; const items = qa(r.item); return { total: items.length, live: items.filter(rendered).length, scrollOk: !r.scroll || !!q(r.scroll), token: S.token, url: location.href }; };
 
   // Mark the first unseen rendered item as seen and (optionally) open it.
@@ -353,7 +367,7 @@ if (!window.__ae || window.__ae.v !== 5) { window.__ae = (() => {
   const step = (r, add, doOpen, f) => {
     S.keyMode = r.key;
     if (add) for (const k of add) S.seen.add(k);
-    const items = qa(r.item); let liveN = 0, scanned = 0;
+    const items = rows(r); let liveN = 0, scanned = 0;
     for (const it of items) {
       if (!rendered(it)) continue; liveN++;
       const k = keyOf(it); if (S.seen.has(k)) continue;
@@ -373,7 +387,7 @@ if (!window.__ae || window.__ae.v !== 5) { window.__ae = (() => {
     S.keyMode = r.key;
     if (add) for (const k of add) S.seen.add(k);
     const out = []; let scanned = 0, stop = false;
-    for (const it of qa(r.item)) {
+    for (const it of rows(r)) {
       if (out.length >= max) break;
       if (!rendered(it)) continue;
       const k = keyOf(it); if (S.seen.has(k)) continue;
@@ -390,7 +404,7 @@ if (!window.__ae || window.__ae.v !== 5) { window.__ae = (() => {
     S.keyMode = r.key;
     if (add) for (const k of add) S.seen.add(k);
     const out = [];
-    for (const it of qa(r.item)) {
+    for (const it of rows(r)) {
       if (!rendered(it)) continue;
       const k = keyOf(it); if (S.seen.has(k)) continue;
       S.seen.add(k);
@@ -404,7 +418,7 @@ if (!window.__ae || window.__ae.v !== 5) { window.__ae = (() => {
     const sc = q(r.scroll);
     // The last rendered row goes to the top: works whichever ancestor really scrolls, and makes a virtualized list render the next rows.
     let last = null;
-    for (const it of qa(r.item)) if (rendered(it)) last = it;
+    for (const it of rows(r)) if (rendered(it)) last = it;
     const top0 = last ? box(last).top : 0;
     const before = sc ? sc.scrollTop : window.scrollY;
     S.clickAt = now();
@@ -415,9 +429,25 @@ if (!window.__ae || window.__ae.v !== 5) { window.__ae = (() => {
       else window.scrollBy(0, window.innerHeight * 0.9);
       moved = Math.abs((sc ? sc.scrollTop : window.scrollY) - before) > 2;
     }
+    // A "Load more" button at the end of the list (infinite scroll does not fire on a hidden page): press it.
+    const listEl = q(r.list) || (last && last.parentElement);
+    if (listEl) {
+      const pool = Array.from(listEl.querySelectorAll('button,[role="button"]')).slice(-12)
+        .concat(listEl.nextElementSibling ? Array.from(listEl.nextElementSibling.querySelectorAll('button,[role="button"]')).slice(0, 3) : []);
+      for (const b of pool) {
+        const t = (b.innerText || b.getAttribute('aria-label') || '').trim();
+        if (t.length < 40 && /^(load|show|see|view) (more|older|next)\b|\bmore (results|conversations|messages|items)$/i.test(t) && !b.disabled) {
+          b.click(); moved = true; break;
+        }
+      }
+    }
     return { moved };
   };
-  const unseen = (r) => { S.keyMode = r.key; let n = 0; for (const it of qa(r.item)) if (rendered(it) && !S.seen.has(keyOf(it))) n++; return n; };
+  // Rows the site has not filled in: placeholders with a size but no text (lazy rendering, stalled on a hidden page).
+  const blanks = (r) => { let blank = 0, all = 0; for (const it of qa(r.item)) { const b = box(it); if (b.height > 8 && b.width > 8) { all++; if (clean(it.textContent).length < 2) blank++; } } return { blank, all, hidden: document.visibilityState !== 'visible' }; };
+  // Placeholder rows inside the window right now: these are the ones a frame should fill.
+  const blankInView = (r) => { let n = 0; for (const it of qa(r.item)) { const b = box(it); if (b.height > 8 && b.bottom > 0 && b.top < window.innerHeight && clean(it.textContent).length < 2) n++; } return n; };
+  const unseen = (r) => { S.keyMode = r.key; let n = 0; for (const it of rows(r)) if (rendered(it) && !S.seen.has(keyOf(it))) n++; return n; };
   // A new run: forget what was seen and go back to the top of the list.
   const reset = (r) => {
     S.seen = new Set(); S.cur = null;
@@ -482,7 +512,7 @@ if (!window.__ae || window.__ae.v !== 5) { window.__ae = (() => {
     };
   };
 
-  return { v: 5, unseen, discover, verify, step, collect, listItems, scrollMore, reset, state, mark, diff, extract, token: () => S.token };
+  return { v: 9, blanks, blankInView, unseen, discover, verify, step, collect, listItems, scrollMore, reset, state, mark, diff, extract, token: () => S.token };
 })(); }
 `;
 
@@ -514,6 +544,7 @@ async function waitStable(
   const quiet = opts.quietMs ?? 180;
   let state: PageState | null = null;
   for (;;) {
+    await frame(page);
     try {
       state = await ev<PageState>(page, 'state', detail);
     } catch {
@@ -535,12 +566,27 @@ async function waitStable(
   }
 }
 
+/** Hidden page: pump frames until the rows inside the window are filled in (bounded), so none is skipped. */
+async function fillRows(page: IPage, recipe: EachRecipe, capMs = 2500): Promise<void> {
+  if (!hiddenRun) return;
+  const end = Date.now() + capMs;
+  let calm = 0;
+  for (;;) {
+    await frame(page);
+    const blank = await ev<number>(page, 'blankInView', recipe).catch(() => 0);
+    calm = blank === 0 ? calm + 1 : 0;
+    if (calm >= 2 || Date.now() >= end) return;
+    await sleep(100);
+  }
+}
+
 /** Scroll for more rows and wait (bounded) until new ones are rendered: lazy lists load them a moment later. */
 async function moreRows(page: IPage, recipe: EachRecipe, waitMs = 2500): Promise<boolean> {
   const m = await ev<{ moved: boolean }>(page, 'scrollMore', recipe);
   const end = Date.now() + (m?.moved ? waitMs : 600);
   for (;;) {
-    if (await ev<number>(page, 'unseen', recipe).catch(() => 0) > 0) return true;
+    await frame(page);
+    if (await ev<number>(page, 'unseen', recipe).catch(() => 0) > 0) { await fillRows(page, recipe, 1500); return true; }
     if (Date.now() >= end) return false;
     await sleep(120);
   }
@@ -607,6 +653,8 @@ export async function runEach(page: IPage, opts: EachOptions = {}): Promise<Each
   }
   const file = recipeFile(dir, listUrl);
   const u = new URL(listUrl);
+  hiddenRun = await isHiddenPage(page);
+  await frame(page);
 
   // ── recipe: cached and still valid, or discovered now ─────────────────
   let recipe: EachRecipe | null = null;
@@ -668,6 +716,7 @@ export async function runEach(page: IPage, opts: EachOptions = {}): Promise<Each
     await ev(page, 'reset', recipe).catch(() => undefined);
     await waitStable(page, '', null, { capMs: 1500, quietMs: 200 });
   }
+  await fillRows(page, recipe);
   const listLoadMs = Date.now() - t0;
 
   // ── run state (resume) and output file ────────────────────────────────
@@ -811,11 +860,19 @@ export async function runEach(page: IPage, opts: EachOptions = {}): Promise<Each
     verdict = 'FAILED';
     message = err instanceof Error ? err.message : String(err);
   }
+  if (verdict === 'DONE') {
+    // The list "ended", but did the site fill every row? Placeholders mean the answer is incomplete.
+    const b = await ev<{ blank: number; all: number; hidden: boolean }>(page, 'blanks', recipe).catch(() => null);
+    if (b && b.blank >= 3 && b.blank >= b.all * 0.2) {
+      verdict = 'CUT_BLANK';
+      message = `${b.blank} of ${b.all} rows are empty placeholders: the site fills rows only while they are drawn on screen${b.hidden ? ', and this page is hidden (the Chrome window is covered by another app or minimised)' : ''}`;
+    }
+  }
   persist();
   const loopMs = Date.now() - loopStart;
   const cut = verdict === 'CUT_TIME' || verdict === 'CUT_LIMIT';
   return {
-    ok: verdict !== 'FAILED',
+    ok: verdict !== 'FAILED' && verdict !== 'CUT_BLANK',
     verdict,
     ...(message ? { message } : {}),
     recipe, recipe_source: source, recipe_file: file,
@@ -823,7 +880,9 @@ export async function runEach(page: IPage, opts: EachOptions = {}): Promise<Each
     opened: !listOnly, scanned, texts,
     timing: timingOf(perItem, listLoadMs, loopMs, Date.now() - t0),
     save,
-    next: verdict === 'FAILED'
+    next: verdict === 'CUT_BLANK'
+      ? `INCOMPLETE: only the filled rows were read (${items.length} item(s) kept); do not conclude that nothing else matches. The page must be visible for this site: stop and ask the user to uncover the Chrome window (or to start the server with --window foreground), then repeat the call with resume=true.`
+      : verdict === 'FAILED'
       ? `Read the message. ${NEXT_OVERRIDE}`
       : cut
         ? `${verdict === 'CUT_LIMIT' ? `Stopped at the limit (${items.length} item(s)); more rows may follow` : 'Time budget used up; more items are left'}: repeat this call with resume=true to continue where it stopped.${listOnly ? ' To read one: do=each find="<its name or date>" limit=1 (opens it).' : ''}`
