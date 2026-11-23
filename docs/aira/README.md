@@ -71,6 +71,12 @@ Tried in this order; each is checked on the page (preview image, attachment elem
 4. `paste`: a paste event with the same files.
 5. `clipboard` (only with `clipboard: true`, macOS): puts the image on the system clipboard and sends a real paste. It replaces the clipboard.
 
+A strategy passes only when the page visibly shows every file: a visible preview image, a visible chip that holds an image or the file name, or the file name in the page text, still there 0.7 s later. Files held by a hidden input do not count.
+
+When Chrome or an old extension refuses the native file set (`Not allowed`), `input` and `capture` put real `File` objects on the input in the page and fire `change` (at most 12 MB).
+
+Checked live on gemini.google.com/app (2026-11-23): `capture` and `drop` both attach; a script `paste` is ignored.
+
 Files can be local paths, `http(s)` URLs or `data:` URIs. Drop and paste carry at most 12 MB.
 
 Known limits: `drop` and `paste` are script events, not trusted ones; sites that check `isTrusted` ignore them. A trusted drag needs `Input.dispatchDragEvent` added to the extension's CDP allowlist (`extension/src/background.ts`), which means loading this fork's extension.

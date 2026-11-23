@@ -136,28 +136,62 @@ export async function convertImage(file: string, opts: { format?: 'png' | 'jpeg'
   }
 }
 
-/** Page-side: what on the page would show that files were attached. */
+/**
+ * Page-side: what on the page shows that files were attached. Strict on purpose:
+ * only things a user would see count (a visible preview image, a visible
+ * preview/chip element that holds an image or the file name, the file name in
+ * the page text). Class names alone prove nothing.
+ */
 function signalJs(names: string[]): string {
   return `
     (() => {
       const names = ${JSON.stringify(names.map((n) => n.toLowerCase()))};
-      const inputs = Array.from(document.querySelectorAll('input[type="file"]'));
+      const visible = (el) => {
+        const r = el.getBoundingClientRect();
+        if (r.width < 12 || r.height < 12) return false;
+        const cs = getComputedStyle(el);
+        return cs.visibility !== 'hidden' && cs.display !== 'none' && Number(cs.opacity) > 0.05;
+      };
+      const all = (sel, root) => {
+        const out = [];
+        const walk = (node) => {
+          for (const el of node.querySelectorAll(sel)) out.push(el);
+          for (const el of node.querySelectorAll('*')) if (el.shadowRoot) walk(el.shadowRoot);
+        };
+        walk(root || document);
+        return out;
+      };
       const held = [];
-      for (const el of inputs) { try { for (const f of el.files) held.push(String(f.name).toLowerCase()); } catch (e) {} }
+      let visibleHeld = 0;
+      for (const el of all('input[type="file"]')) {
+        try { for (const f of el.files) { held.push(String(f.name).toLowerCase()); if (visible(el)) visibleHeld++; } } catch (e) {}
+      }
+      const media = all('img[src^="blob:"],img[src^="data:image"],video[src^="blob:"]').filter(visible).length;
+      const chipSel = '[class*="preview" i],[class*="attachment" i],[class*="thumbnail" i],[class*="file-chip" i],[class*="chip" i][class*="file" i],[data-test-id*="preview" i],[data-testid*="attachment" i],[data-testid*="preview" i]';
+      const chips = all(chipSel).filter((el) => {
+        if (!visible(el)) return false;
+        const tag = el.tagName.toLowerCase();
+        if (tag === 'img' || tag === 'video') return false;
+        if (el.querySelector('[class*="preview" i],[class*="attachment" i],[class*="thumbnail" i],[class*="file-chip" i]')) return false; // count leaves only
+        const text = ((el.textContent || '') + ' ' + (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '')).toLowerCase();
+        const pic = el.querySelector('img,video,canvas') || /url\\(/.test(getComputedStyle(el).backgroundImage || '');
+        return !!pic || names.some((n) => text.includes(n));
+      }).length;
       const text = ((document.body && document.body.innerText) || '').toLowerCase();
-      const attrs = Array.from(document.querySelectorAll('[alt],[title],[aria-label]'))
+      const attrs = all('[alt],[title],[aria-label]').filter(visible)
         .map((el) => ((el.getAttribute('alt') || '') + ' ' + (el.getAttribute('title') || '') + ' ' + (el.getAttribute('aria-label') || '')).toLowerCase()).join(' ');
       return {
         held: names.filter((n) => held.includes(n)).length,
-        blobs: document.querySelectorAll('img[src^="blob:"],img[src^="data:image"],video[src^="blob:"]').length,
-        previews: document.querySelectorAll('[class*="preview" i],[class*="attachment" i],[class*="thumbnail" i],[class*="file-chip" i],[class*="uploaded" i],[data-test-id*="file" i],[data-testid*="attachment" i],[data-testid*="file" i]').length,
+        visibleHeld,
+        blobs: media,
+        previews: chips,
         named: names.filter((n) => text.includes(n) || attrs.includes(n)).length,
       };
     })()
   `;
 }
 
-interface Signal { held: number; blobs: number; previews: number; named: number }
+interface Signal { held: number; visibleHeld?: number; blobs: number; previews: number; named: number }
 
 function evidence(before: Signal, after: Signal): string {
   const parts: string[] = [];
@@ -168,20 +202,58 @@ function evidence(before: Signal, after: Signal): string {
   return parts.join(', ');
 }
 
-/** Visible on the page (preview / name), not just held by an input. */
+/** How many of the files the page visibly shows (best of the three visible signals). */
+function shownCount(before: Signal, after: Signal): number {
+  return Math.max(after.blobs - before.blobs, after.previews - before.previews, after.named - before.named, 0);
+}
+
+let expected = 1;
+/** Every file is visible on the page (preview / chip / name), not just held by an input. */
 function shown(before: Signal, after: Signal): boolean {
-  return after.blobs > before.blobs || after.previews > before.previews || after.named > before.named;
+  return shownCount(before, after) >= expected;
 }
 
 async function waitForSignal(page: IPage, names: string[], before: Signal, ms: number): Promise<Signal> {
   const end = Date.now() + ms;
   let after = before;
   while (Date.now() < end) {
-    try { after = await page.evaluate(signalJs(names)) as Signal; } catch { /* page busy */ }
-    if (shown(before, after)) return after;
+    try { const now = await page.evaluate(signalJs(names)) as Signal | undefined; if (now && typeof now === 'object') after = now; } catch { /* page busy */ }
+    if (shown(before, after)) {
+      // Previews that vanish again (the site rejected the file) do not count.
+      await sleep(700);
+      try { const again = await page.evaluate(signalJs(names)) as Signal | undefined; if (again && typeof again === 'object') after = again; } catch { /* keep */ }
+      if (shown(before, after)) return after;
+    }
     await sleep(350);
   }
   return after;
+}
+
+/** Page-side: put real File objects on the marked input and fire input/change. */
+function setFilesJs(token: string, files: Array<{ name: string; type: string; b64: string }>): string {
+  return `
+    (() => {
+      const files = ${JSON.stringify(files)};
+      const find = (root) => {
+        const hit = root.querySelector('[data-aira-upload="${token}"]');
+        if (hit) return hit;
+        for (const el of root.querySelectorAll('*')) if (el.shadowRoot) { const h = find(el.shadowRoot); if (h) return h; }
+        return null;
+      };
+      const input = find(document);
+      if (!input) return { ok: false, why: 'the file input disappeared' };
+      const dt = new DataTransfer();
+      for (const f of files) {
+        const bin = atob(f.b64); const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        dt.items.add(new File([bytes], f.name, { type: f.type, lastModified: Date.now() }));
+      }
+      try { input.files = dt.files; } catch (e) { return { ok: false, why: 'the browser refused the file list: ' + e }; }
+      // One event only: sites that listen to both input and change would attach every file twice.
+      input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+      return { ok: input.files.length === files.length, why: 'input took ' + input.files.length + ' file(s)' };
+    })()
+  `;
 }
 
 const MARK = 'data-aira-upload';
@@ -280,9 +352,12 @@ const capturedJs = `(() => !!(window.__aira_fc && window.__aira_fc.input))()`;
 
 const UPLOAD_WORDS = /upload|attach|add (a )?(file|photo|image|picture|media)|choose file|browse|select file|from (computer|device)|insert (image|file)|paperclip|add files|photos?$|загруз|прикреп|файл/i;
 
+/** Controls that mention files but remove or dismiss them. */
+const NOT_UPLOAD_WORDS = /close|remove|delete|cancel|clear|dismiss|discard|download|удал|закр|отмен/i;
+
 function uploadControls(targets: PreciseTarget[], exclude = new Set<number>()): PreciseTarget[] {
   return targets
-    .filter((t) => t.in_viewport && !t.disabled && !t.covered_by && !exclude.has(t.ref) && UPLOAD_WORDS.test(t.name))
+    .filter((t) => t.in_viewport && !t.disabled && !t.covered_by && !exclude.has(t.ref) && UPLOAD_WORDS.test(t.name) && !NOT_UPLOAD_WORDS.test(t.name))
     .sort((a, b) => Number(/upload|attach|file/i.test(b.name)) - Number(/upload|attach|file/i.test(a.name)));
 }
 
@@ -377,10 +452,26 @@ export async function smartUpload(page: IPage, specs: string[], opts: SmartUploa
   let names = files.map((f) => path.basename(f));
   let before = await page.evaluate(signalJs(names)) as Signal;
 
+  expected = files.length;
+  let via = '';
+  /** Native route first (real paths, any size); when Chrome or the extension refuses, set File objects in the page. */
+  const setBatch = async (batch: string[]): Promise<void> => {
+    let nativeError: unknown;
+    if (typeof page.setFileInput === 'function') {
+      try { await page.setFileInput(batch, selector); via = 'native'; return; } catch (err) { nativeError = err; }
+    }
+    const inline = inlineFiles(batch);
+    if (typeof inline === 'string') throw new Error(nativeError ? `${explain(nativeError)}; and ${inline}` : inline);
+    const res = await page.evaluate(setFilesJs(token, inline)) as { ok: boolean; why?: string } | undefined;
+    if (!res?.ok) {
+      const why = res?.why ?? 'no answer from the page';
+      throw new Error(nativeError ? `${explain(nativeError)}; setting the files in the page also failed: ${why}` : why);
+    }
+    via = 'in-page';
+  };
   const setOnMarked = async (multiple: boolean): Promise<void> => {
-    if (typeof page.setFileInput !== 'function') throw new Error('not supported by this browser backend');
-    if (multiple || files.length === 1) { await page.setFileInput(files, selector); return; }
-    for (const f of files) { await page.setFileInput([f], selector); await sleep(700); }
+    if (multiple || files.length === 1) { await setBatch(files); return; }
+    for (const f of files) { await setBatch([f]); await sleep(700); }
   };
 
   try {
@@ -401,13 +492,13 @@ export async function smartUpload(page: IPage, specs: string[], opts: SmartUploa
           await setOnMarked(pick.multiple === true);
           const after = await waitForSignal(page, names, before, pick.visible ? 1500 : verifyMs);
           if (shown(before, after)) { attempts.push({ strategy, ok: true, detail: evidence(before, after) }); return done(true, strategy, files, evidence(before, after)); }
-          if (pick.visible && after.held > before.held) {
+          if (pick.visible && (after.visibleHeld ?? 0) >= files.length) {
             attempts.push({ strategy, ok: true, detail: evidence(before, after) });
             return done(true, strategy, files, `${evidence(before, after)} (plain form field, no preview)`);
           }
           // A hidden input took the files but the page did not react: it is not wired up. Undo and go on.
           await page.evaluate(clearMarkedJs(token)).catch(() => undefined);
-          attempts.push({ strategy, ok: false, detail: `files were set on a hidden input (accept="${pick.accept ?? ''}") but the page showed nothing` });
+          attempts.push({ strategy, ok: false, detail: `files were set on a hidden input (${via}, accept="${pick.accept ?? ''}") but the page showed ${shownCount(before, after)} of ${files.length}` });
           continue;
         }
 
@@ -443,8 +534,8 @@ export async function smartUpload(page: IPage, specs: string[], opts: SmartUploa
             continue;
           }
           const after = await waitForSignal(page, names, before, verifyMs);
-          const ok = shown(before, after) || after.held > before.held;
-          attempts.push({ strategy, ok, detail: ok ? evidence(before, after) : 'files were set on the site\'s own input but the page showed nothing' });
+          const ok = shown(before, after);
+          attempts.push({ strategy, ok, detail: ok ? `${evidence(before, after)} (files set ${via})` : `files were set on the site's own input (${via}) but the page showed ${shownCount(before, after)} of ${files.length}` });
           if (ok) return done(true, strategy, files, evidence(before, after));
           continue;
         }
