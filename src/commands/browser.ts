@@ -14,6 +14,7 @@ import { sanitizeCapturedRequest, sanitizeCapturedUrl, type SafeNetworkRequest }
 import { profileRouteParams, resolveProfileSelection, type ProfileSelection } from '../browser/profile.js';
 import { preciseAt, preciseClick, preciseTargets, readPreciseLog } from '../browser/precise.js';
 import { smartUpload, type UploadStrategy } from '../browser/upload.js';
+import { resolveLabel } from '../mcp/actions.js';
 import { parseFilter, shapeMatchesFilter } from '../browser/shape-filter.js';
 import { inferShape } from '../browser/shape.js';
 import { TargetError, type TargetErrorCode } from '../browser/target-errors.js';
@@ -1431,7 +1432,7 @@ export function registerBrowserCommands(program: Command): Command {
 
   addBrowserTabOption(
     addSemanticLocatorOptions(browser.command('pclick'))
-      .argument('[target]', 'Numeric ref (from targets / state), CSS selector, or "x,y" in CSS px')
+      .argument('[target]', 'Numeric ref (from targets / state), label:<name> or label:<role>:<name>, CSS selector, or "x,y" in CSS px')
       .option('--nth <n>', 'When <target> is a multi-match CSS selector, pick the nth match (0-based)')
       .option('--expect <js>', 'JS expression that must be truthy after the click (PASS / EXPECT_FAILED)')
       .option('--force', 'Click even when the target is covered or the point is not clickable', false)
@@ -1441,7 +1442,15 @@ export function registerBrowserCommands(program: Command): Command {
   )
     .action(browserAction(async (page, target, opts) => {
       let clickTarget: string;
-      if (typeof target === 'string' && /^\s*-?\d+(\.\d+)?\s*,\s*-?\d+(\.\d+)?\s*$/.test(target)) {
+      if (typeof target === 'string' && target.startsWith('label:')) {
+        const found = await resolveLabel(page, target.slice(6));
+        if (typeof found !== 'string') {
+          emitResult({ clicked: false, verdict: 'NOT_FOUND', reason: found.error, next: found.next });
+          process.exitCode = EXIT_CODES.GENERIC_ERROR;
+          return;
+        }
+        clickTarget = found;
+      } else if (typeof target === 'string' && /^\s*-?\d+(\.\d+)?\s*,\s*-?\d+(\.\d+)?\s*$/.test(target)) {
         clickTarget = target;
       } else {
         const resolvedTarget = await resolveExplicitOrSemanticTarget(page, target, opts ?? {}, 'write');
