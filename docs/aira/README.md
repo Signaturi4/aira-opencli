@@ -41,14 +41,14 @@ OPTIONS 23
 | `do` | Fields | Result |
 |---|---|---|
 | `open` | `url` | navigates, waits at most 12 s + 5 s, marks `STILL LOADING` instead of hanging |
-| `look` | `find`, `max` | the options list only |
-| `click` | `target`, `expect`, `force` | one trusted click with a verdict |
+| `look` | `find`, `max`, `offset` | the options list only; `find` always filters (`0 matches of N` when nothing fits); the answer prints the call for the next page |
+| `click` | `target`, `expect`, `force` | one click with its effect: `PASS, page changed (...)`, `PASS, clicked; only the focus moved`, or `clicked, no change seen` |
 | `type` | `target`, `text`, `submit` | types, optionally presses Enter |
 | `key` | `key` | one key press |
 | `upload` | `files`, `target`, `clipboard`, `convert`, `max_px` | attaches files, says which strategy worked |
 | `wait` | `until`, `gone`, `selector`, `seconds` | waits for text or an element |
-| `scroll` | `direction` | scrolls one screen |
-| `read` | `selector` | visible text |
+| `scroll` | `direction`, `target` | scrolls the region of `target` (ref, `label:` of a row or of the list, selector, `x,y`); without target the page, or the list under the middle of the screen when the page cannot scroll. Says what moved (`ul "..." +701 px, 74 -> 82 rows`) or `ERR nothing scrolled` |
+| `read` | `selector` | visible text; line 1 names the region that was read |
 | `images` / `save` | `target`, `path` | lists large images, saves one to disk |
 | `shot` | `path` | annotated screenshot |
 | `help` / `debug` | `max` | playbook, recent log lines (no browser needed) |
@@ -67,6 +67,8 @@ Open a page with a list (inbox, search results, catalogue) and call `do=each`. N
 5. **Recipe** is cached per origin + path pattern in `~/.opencli/aira-mcp/recipes/` and re-verified on use; a stale one is discovered again.
 
 Options: `limit`, `time_budget` (seconds, default 100; continue with `resume=true`), `min_interval_ms` (default 300, the floor between two items), `save=<file>` (JSON lines, one item per line; default under `~/.opencli/aira-mcp/each/`).
+
+Search without opening: `mode=list` returns the rows only (name, date, snippet), opens nothing and marks nothing read. `find=<text>` keeps the rows whose text or date contains it (also in open mode, so `find="Dec 10, 2025" limit=1` opens just that one); `until=<text>` stops at the first row that contains it. Dates are printed as the site shows them, plus the full date when a `time[datetime]` or `title` attribute holds one. The first line says whether items were opened (`OPENED n` / `LISTED n, nothing opened`) and how many rows were looked at. CLI: `browser each --list --find <text> --until <text>`.
 
 The answer is one line per item, a `TIMING` block (list load, per item median / p90 / max, items per minute) and the file path. It is read-only: it only opens items and never types or submits. It works on a hidden tab and does not take the foreground queue. On sites with unread markers, opening an item marks it read; the answer says how many.
 
@@ -90,6 +92,8 @@ Tried in this order; each is checked on the page (preview image, attachment elem
 3. `drop`: a drop with real `File` objects on the editor or drop zone.
 4. `paste`: a paste event with the same files.
 5. `clipboard` (only with `clipboard: true`, macOS): puts the image on the system clipboard and sends a real paste. It replaces the clipboard.
+
+On a hidden page (Chrome covered by another app) clicks are in-page and menu animations do not finish, so `capture` clicks menu items inside the page and, when the site does not react to untrusted clicks, `drop` attaches the files. Menus a failed strategy opened are closed before the next one runs. A failure ends with a `STATE` line (attachments on the page now and before the call, open menus, the site's own message); when previews were already there, `NEXT` says to remove them first (sites cap attachments, Gemini at 10).
 
 A strategy passes only when the page visibly shows every file: a visible preview image, a visible chip that holds an image or the file name, or the file name in the page text, still there 0.7 s later. Files held by a hidden input do not count.
 

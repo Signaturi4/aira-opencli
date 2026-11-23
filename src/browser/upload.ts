@@ -62,6 +62,10 @@ export interface SmartUploadResult {
   attempts: SmartUploadAttempt[];
   /** What changed on the page, e.g. "previews +2". */
   evidence?: string;
+  /** Attachments the page already showed before this call. */
+  already?: number;
+  /** One line on the page state after a failure (open menus, attachments, site messages). */
+  state?: string;
   next: string;
 }
 
@@ -355,9 +359,9 @@ const UPLOAD_WORDS = /upload|attach|add (a )?(file|photo|image|picture|media)|ch
 /** Controls that mention files but remove or dismiss them. */
 const NOT_UPLOAD_WORDS = /close|remove|delete|cancel|clear|dismiss|discard|download|удал|закр|отмен/i;
 
-function uploadControls(targets: PreciseTarget[], exclude = new Set<number>()): PreciseTarget[] {
+function uploadControls(targets: PreciseTarget[], exclude = new Set<number>(), allowCovered = false): PreciseTarget[] {
   return targets
-    .filter((t) => t.in_viewport && !t.disabled && !t.covered_by && !exclude.has(t.ref) && UPLOAD_WORDS.test(t.name) && !NOT_UPLOAD_WORDS.test(t.name))
+    .filter((t) => t.in_viewport && !t.disabled && (allowCovered || !t.covered_by) && !exclude.has(t.ref) && UPLOAD_WORDS.test(t.name) && !NOT_UPLOAD_WORDS.test(t.name))
     .sort((a, b) => Number(/upload|attach|file/i.test(b.name)) - Number(/upload|attach|file/i.test(a.name)));
 }
 
@@ -396,6 +400,50 @@ function transferJs(kind: 'drop' | 'paste', files: Array<{ name: string; type: s
   `;
 }
 
+/** Page-side: click one numbered element directly (no hit-testing), for menu items a stalled animation keeps "covered". */
+const domClickRefJs = (ref: number) => `
+  (() => {
+    const el = document.querySelector('[data-opencli-ref="${ref}"]');
+    if (!el) return false;
+    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup']) {
+      el.dispatchEvent(new (type[0] === 'p' ? PointerEvent : MouseEvent)(type, { bubbles: true, cancelable: true, composed: true, view: window, button: 0 }));
+    }
+    el.click();
+    return true;
+  })()
+`;
+
+/** Page-side: how many menus / overlays are open right now. */
+const OPEN_LAYERS_JS = `
+  (() => {
+    const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 2 && r.height > 2 && getComputedStyle(el).display !== 'none'; };
+    return Array.from(document.querySelectorAll('[role="menu"],[role="listbox"],[role="dialog"],.cdk-overlay-pane,.cdk-overlay-backdrop')).filter(vis).length;
+  })()
+`;
+
+/** Page-side: close menus a strategy opened (Escape as an in-page event, then the overlay backdrop). Works on a hidden page. */
+const CLOSE_LAYERS_JS = `
+  (async () => {
+    const count = () => ${OPEN_LAYERS_JS.trim()};
+    const before = count();
+    if (!before) return { before: 0, after: 0 };
+    const key = { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true, cancelable: true, composed: true };
+    const el = document.activeElement || document.body;
+    el.dispatchEvent(new KeyboardEvent('keydown', key));
+    el.dispatchEvent(new KeyboardEvent('keyup', key));
+    await new Promise((r) => setTimeout(r, 250));
+    if (count()) for (const b of document.querySelectorAll('.cdk-overlay-backdrop,[class*="backdrop" i]')) { try { b.click(); } catch (e) {} }
+    await new Promise((r) => setTimeout(r, 250));
+    return { before, after: count() };
+  })()
+`;
+
+/** Page-side: what the site says right now (toasts, alerts), for the failure line. */
+const SITE_MESSAGE_JS = `
+  (() => Array.from(document.querySelectorAll('[role="alert"],[role="status"],simple-snack-bar,[class*="snack" i],[class*="toast" i]'))
+    .map((el) => (el.innerText || '').replace(/\\s+/g, ' ').trim()).filter((t) => t.length > 3).slice(0, 2).join(' | ').slice(0, 200))()
+`;
+
 const MAX_INLINE_BYTES = 12 * 1024 * 1024;
 
 function inlineFiles(files: string[]): Array<{ name: string; type: string; b64: string }> | string {
@@ -406,28 +454,29 @@ function inlineFiles(files: string[]): Array<{ name: string; type: string; b64: 
 
 function explain(err: unknown): string {
   const message = err instanceof Error ? err.message : String(err);
-  if (/Not allowed/i.test(message)) {
-    return 'Chrome refused to set files through the debugger ("Not allowed", crbug 928255). The extension must use file-chooser interception: reload the OpenCLI extension from this fork (or update it) so CLI and extension match.';
-  }
+  if (/^Chrome refused/.test(message)) return message.slice(0, 400);
+  if (/Not allowed/i.test(message)) return 'Chrome refused to set files through the debugger ("Not allowed", crbug 928255)';
   if (/fileChooserOpened not received/i.test(message)) return 'the input did not open a file chooser when clicked (it is not wired up yet)';
   if (/No element found matching selector/i.test(message)) return 'the file input disappeared before the files could be set';
-  if (/no count|not supported/i.test(message)) return 'the connected extension is too old for file upload; update or reload it';
+  if (/no count|not supported/i.test(message)) return 'the connected extension did not accept the file-upload command';
   return message.slice(0, 200);
 }
 
 /** Attach files to the page, trying each strategy until the page shows them. */
 export async function smartUpload(page: IPage, specs: string[], opts: SmartUploadOptions = {}): Promise<SmartUploadResult> {
   const attempts: SmartUploadAttempt[] = [];
+  let already = 0;
   const done = (ok: boolean, strategy: UploadStrategy | undefined, files: string[], ev?: string): SmartUploadResult => ({
     verdict: ok ? 'PASS' : 'FAILED',
     ...(strategy ? { strategy } : {}),
     files,
     attempts,
     ...(ev ? { evidence: ev } : {}),
+    ...(already > 0 ? { already } : {}),
     next: ok
       ? 'Files are attached. Continue with the task.'
-      : attempts.some((a) => /Not allowed|too old|reload/i.test(a.detail))
-        ? 'Stop and tell the user: the OpenCLI Chrome extension must be reloaded/updated to match this CLI.'
+      : already > 0
+        ? `The page already showed ${already} image or attachment preview(s) before this call, so the site may have reached its limit or refused duplicates. Remove the old attachments (their remove/close buttons, do=look find=remove) or start from a clean page (do=open the URL again), then upload once. Do not repeat the same call.`
         : `No strategy made the page show the files. Pass target=<ref of the site's upload button or drop zone>${opts.clipboard ? '' : ', or clipboard=true to allow a real paste (replaces the clipboard)'}, or use do=shot to look at the page.`,
   });
 
@@ -451,6 +500,7 @@ export async function smartUpload(page: IPage, specs: string[], opts: SmartUploa
   const selector = `[${MARK}="${token}"]`;
   let names = files.map((f) => path.basename(f));
   let before = await page.evaluate(signalJs(names)) as Signal;
+  already = Math.max(before.blobs, before.previews);
 
   expected = files.length;
   let via = '';
@@ -508,13 +558,30 @@ export async function smartUpload(page: IPage, specs: string[], opts: SmartUploa
           const clicked: string[] = [];
           try {
             const seen = new Set<number>();
+            const seenNames = new Set<string>(); // refs are renumbered when the page re-renders
             for (let depth = 0; depth < 3 && !captured; depth++) {
               let control: string | null = null;
               if (depth === 0 && hint) control = hint;
               else {
-                const map = await preciseTargets(page, {});
-                const pick = uploadControls(map.targets, seen)[0];
-                if (pick) { control = String(pick.ref); seen.add(pick.ref); clicked.push(`"${pick.name}"`); }
+                // A menu opened by the last click needs a moment; on a hidden page its animation never
+                // finishes, so its items stay "covered": those are clicked inside the page instead.
+                let pick: PreciseTarget | undefined;
+                let covered: PreciseTarget | undefined;
+                for (let wait = 0; wait < (depth === 0 ? 1 : 4) && !pick; wait++) {
+                  if (wait) await sleep(300);
+                  const map = await preciseTargets(page, {});
+                  const fresh = (t: PreciseTarget) => !seenNames.has(t.name);
+                  pick = uploadControls(map.targets, seen).filter(fresh)[0];
+                  covered = pick ? undefined : uploadControls(map.targets, seen, true).filter(fresh)[0];
+                }
+                if (!pick && covered) {
+                  seen.add(covered.ref); seenNames.add(covered.name); clicked.push(`"${covered.name}" (in-page)`);
+                  await page.evaluate(domClickRefJs(covered.ref));
+                  await sleep(450);
+                  captured = (await page.evaluate(capturedJs)) === true;
+                  continue;
+                }
+                if (pick) { control = String(pick.ref); seen.add(pick.ref); seenNames.add(pick.name); clicked.push(`"${pick.name}"`); }
               }
               if (!control) break;
               const r = await preciseClick(page, control, { settleMs: 450 });
@@ -530,7 +597,7 @@ export async function smartUpload(page: IPage, specs: string[], opts: SmartUploa
           }
           if (!captured) {
             attempts.push({ strategy, ok: false, detail: clicked.length ? `clicked ${clicked.join(' then ')} but the site did not reach for a file input` : 'no upload button found (pass target=<ref>)' });
-            await page.pressKey('Escape').catch(() => undefined);
+            await page.evaluate(CLOSE_LAYERS_JS).catch(() => undefined);
             continue;
           }
           const after = await waitForSignal(page, names, before, verifyMs);
@@ -580,7 +647,18 @@ export async function smartUpload(page: IPage, specs: string[], opts: SmartUploa
   } finally {
     await page.evaluate(unmarkJs).catch(() => undefined);
   }
-  return done(false, undefined, files);
+  const result = done(false, undefined, files);
+  try {
+    const layers = await page.evaluate(CLOSE_LAYERS_JS) as { before: number; after: number };
+    const now = await page.evaluate(signalJs(names)) as Signal;
+    const said = await page.evaluate(SITE_MESSAGE_JS) as string;
+    result.state = [
+      `page shows ${Math.max(now.blobs, now.previews)} attachment(s) (${already} before this call)`,
+      layers.before ? (layers.after ? `${layers.after} menu/overlay still open (could not close it)` : 'menus opened by the attempts were closed') : 'no menu or overlay left open',
+      said ? `site says: "${said}"` : '',
+    ].filter(Boolean).join('; ');
+  } catch { /* state line is best effort */ }
+  return result;
 }
 
 /** One line per attempt, for CLI and MCP answers. */
@@ -589,5 +667,6 @@ export function describeUpload(result: SmartUploadResult): string {
     ? `PASS via ${result.strategy} (${result.files.length} file(s); ${result.evidence ?? 'attached'})`
     : `FAILED (${result.files.length} file(s))`;
   const tried = result.attempts.map((a) => `  ${a.strategy}: ${a.ok ? 'ok' : 'no'} - ${a.detail}`).join('\n');
-  return tried ? `${head}\n${tried}` : head;
+  const state = result.state ? `\nSTATE ${result.state}` : '';
+  return (tried ? `${head}\n${tried}` : head) + state;
 }

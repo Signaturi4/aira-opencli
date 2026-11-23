@@ -20,6 +20,8 @@ export interface ScreenOptions {
   max?: number;
   /** Keep only options whose role or name contains this text (case-insensitive). */
   find?: string;
+  /** Skip this many options (paging). */
+  offset?: number;
 }
 
 function clip(text: string, n: number): string {
@@ -41,15 +43,21 @@ export function renderOption(t: PreciseTarget): string {
 export function renderScreen(map: PreciseTargetsResult, opts: ScreenOptions = {}): string {
   const max = Math.max(1, opts.max ?? 40);
   const needle = opts.find?.trim().toLowerCase();
-  const pool = needle
-    ? map.targets.filter((t) => `${t.role} ${t.tag} ${t.name}`.toLowerCase().includes(needle))
-    : map.targets.filter((t) => !t.noise);
-  const shown = pool.slice(0, max);
+  const all = map.targets.filter((t) => !t.noise);
+  const pool = needle ? all.filter((t) => `${t.role} ${t.tag} ${t.name}`.toLowerCase().includes(needle)) : all;
+  const start = Math.min(Math.max(0, Math.floor(opts.offset ?? 0)), pool.length);
+  const shown = pool.slice(start, start + max);
+  const end = start + shown.length;
+  const whole = start === 0 && end === pool.length;
+  const count = needle && pool.length === 0
+    ? `0 matches of ${all.length} for "${needle}"`
+    : `${whole ? pool.length : `${start + 1}-${end} of ${pool.length}`}${needle ? ` matching "${needle}"` : ''}`;
   const lines = [
     `PAGE ${clip(map.title || '(untitled)', 60)} | ${clip(map.url, 120)}`,
-    `OPTIONS ${shown.length}${pool.length > shown.length || map.truncated ? ` of ${Math.max(pool.length, map.count)} (use find or scroll)` : ''}${needle ? ` matching "${needle}"` : ''}`,
+    `OPTIONS ${count}`,
     ...shown.map(renderOption),
   ];
-  if (shown.length === 0) lines.push(needle ? '(nothing matches; call look without find)' : '(no clickable elements yet; wait or scroll)');
+  if (end < pool.length) lines.push(`MORE do=look offset=${end}${needle ? ` find="${needle}"` : ''}${opts.max ? ` max=${max}` : ''} shows the next ones; find=<word> narrows. For the rows of a list or inbox use do=each mode=list.`);
+  if (pool.length === 0) lines.push(needle ? '(find only looks at names of clickable elements; try a shorter word, or do=each mode=list find=<text> for list rows, or do=read for page text)' : '(no clickable elements yet; wait or scroll)');
   return lines.join('\n');
 }

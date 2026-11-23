@@ -53,6 +53,12 @@ export interface EachOptions {
   resume?: boolean;
   save?: string;
   rediscover?: boolean;
+  /** list: only report what the list shows (name, date, snippet); nothing is opened or marked read. Default open. */
+  mode?: 'open' | 'list';
+  /** Only items whose list text (name, date, snippet) contains this; others are skipped unopened. */
+  find?: string;
+  /** Stop the walk at the first item whose list text contains this. */
+  until?: string;
   /** Characters of body kept per item. Default 4000. */
   maxChars?: number;
   /** Scroll rounds without a new item before the list counts as finished. Default 3. */
@@ -65,6 +71,10 @@ export interface EachItem {
   i: number;
   key: string;
   list_title: string;
+  /** Date as the list shows it, and the full date when an attribute holds one. */
+  date?: string;
+  full_date?: string;
+  snippet?: string;
   title: string;
   url: string;
   unread: boolean;
@@ -96,6 +106,12 @@ export interface EachResult {
   items_n: number;
   resumed_from: number;
   unread_n: number;
+  /** False in list mode: nothing was clicked. */
+  opened: boolean;
+  /** Items looked at in the list, including those the filter skipped. */
+  scanned: number;
+  /** End of the detail text of the first items, so a short answer needs no file read. */
+  texts: Array<{ i: number; chars: number; text: string }>;
   timing?: EachTiming;
   save?: string;
   next: string;
@@ -108,7 +124,7 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
  * Plain JS in a raw string: no template placeholders, no backticks.
  */
 const PAGE_LIB = String.raw`
-if (!window.__ae) { window.__ae = (() => {
+if (!window.__ae || window.__ae.v !== 5) { window.__ae = (() => {
   const S = { seen: new Set(), last: 0, lastD: 0, n: 0, detailSel: '', marks: null, cur: null, keyMode: 'href', clickAt: 0, reqs: [], token: Math.random().toString(36).slice(2) };
   const now = () => performance.now();
   const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
@@ -233,6 +249,26 @@ if (!window.__ae) { window.__ae = (() => {
     return textKey(item);
   };
   const titleOf = (item) => { const t = (item.innerText || item.textContent || '').split('\n').map(clean).filter((x) => x.length > 1); return (t[0] || '').slice(0, 80); };
+  const DATE_RE = /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}\b|\b\d{1,2}[\/.-]\d{1,2}([\/.-]\d{2,4})?\b|\b\d{1,2}:\d{2}\b|\b(yesterday|today|mon|tue|wed|thu|fri|sat|sun)[a-z]*\b|\b\d+\s?(min|m|h|d|w|mo|y)\b/i;
+  // What the list shows for one item: name, date (with the full date when an attribute holds it), snippet.
+  const infoOf = (item) => {
+    const lines = (item.innerText || item.textContent || '').split('\n').map(clean).filter((x) => x.length > 1);
+    let date = '', full = '';
+    const t = item.querySelector('time');
+    if (t) { date = clean(t.textContent); full = t.getAttribute('datetime') || t.getAttribute('title') || ''; }
+    if (!full) {
+      for (const e of Array.from(item.querySelectorAll('[title],[aria-label],[datetime]')).slice(0, 60)) {
+        const v = e.getAttribute('datetime') || e.getAttribute('title') || e.getAttribute('aria-label') || '';
+        if (v.length <= 60 && /\b(19|20)\d\d\b/.test(v) && (DATE_RE.test(v) || /^\d{4}-\d{2}-\d{2}/.test(v))) { full = v; if (!date) date = clean(e.textContent).slice(0, 24); break; }
+      }
+    }
+    if (!date) { const m = lines.find((l) => l.length <= 24 && DATE_RE.test(l)); if (m) date = m; }
+    if (full === date) full = '';
+    const title = (lines[0] || '').slice(0, 80);
+    const rest = lines.slice(1).filter((l) => l !== date && l !== title);
+    return { title, date, full, snippet: rest.join(' / ').slice(0, 140), text: (lines.join(' ') + ' ' + full).toLowerCase() };
+  };
+  const has = (info, needle) => !!needle && info.text.indexOf(String(needle).toLowerCase()) >= 0;
   const unreadOf = (item) => {
     if (/\bunread\b|new notification/i.test(item.textContent || '')) return true;
     const els = Array.from(item.querySelectorAll('*')).slice(0, 120);
@@ -313,19 +349,41 @@ if (!window.__ae) { window.__ae = (() => {
   const verify = (r) => { S.keyMode = r.key; const items = qa(r.item); return { total: items.length, live: items.filter(rendered).length, scrollOk: !r.scroll || !!q(r.scroll), token: S.token, url: location.href }; };
 
   // Mark the first unseen rendered item as seen and (optionally) open it.
-  const step = (r, add, doOpen) => {
+  // f = { find, until }: items without the find text in their list text are skipped unopened; the walk stops at the until text.
+  const step = (r, add, doOpen, f) => {
     S.keyMode = r.key;
     if (add) for (const k of add) S.seen.add(k);
-    const items = qa(r.item); let liveN = 0;
+    const items = qa(r.item); let liveN = 0, scanned = 0;
     for (const it of items) {
       if (!rendered(it)) continue; liveN++;
       const k = keyOf(it); if (S.seen.has(k)) continue;
-      S.seen.add(k); S.cur = it;
-      const out = { key: k, title: titleOf(it), unread: unreadOf(it), href: hrefOf(it), live: liveN, total: items.length };
+      S.seen.add(k); scanned++;
+      const info = infoOf(it);
+      if (f && f.until && has(info, f.until)) return { stop: true, scanned, live: liveN, total: items.length };
+      if (f && f.find && !has(info, f.find)) continue;
+      S.cur = it;
+      const out = { key: k, title: info.title, date: info.date, full: info.full, snippet: info.snippet, unread: unreadOf(it), href: hrefOf(it), live: liveN, total: items.length, scanned };
       if (doOpen) { it.scrollIntoView({ block: 'center' }); const op = opener(it) || (r.key === 'href' ? titleLink(it) : null) || it; S.clickAt = now(); out.opened = openItem(it, op); }
       return out;
     }
-    return { none: true, live: liveN, total: items.length };
+    return { none: true, scanned, live: liveN, total: items.length };
+  };
+  // List mode: the unseen rendered items as they stand in the list. Nothing is clicked.
+  const listItems = (r, add, f, max) => {
+    S.keyMode = r.key;
+    if (add) for (const k of add) S.seen.add(k);
+    const out = []; let scanned = 0, stop = false;
+    for (const it of qa(r.item)) {
+      if (out.length >= max) break;
+      if (!rendered(it)) continue;
+      const k = keyOf(it); if (S.seen.has(k)) continue;
+      S.seen.add(k); scanned++;
+      const info = infoOf(it);
+      if (f && f.until && has(info, f.until)) { stop = true; break; }
+      if (f && f.find && !has(info, f.find)) continue;
+      out.push({ key: k, title: info.title, date: info.date, full: info.full, snippet: info.snippet, unread: unreadOf(it), href: hrefOf(it) });
+    }
+    return { items: out, scanned, stop };
   };
   // Navigate mode: every unseen rendered item at once.
   const collect = (r, add) => {
@@ -337,24 +395,35 @@ if (!window.__ae) { window.__ae = (() => {
       const k = keyOf(it); if (S.seen.has(k)) continue;
       S.seen.add(k);
       const href = hrefOf(it); if (!href) continue;
-      out.push({ key: k, title: titleOf(it), unread: unreadOf(it), href });
+      const info = infoOf(it);
+      out.push({ key: k, title: info.title, date: info.date, full: info.full, snippet: info.snippet, text: info.text, unread: unreadOf(it), href });
     }
     return out;
   };
   const scrollMore = (r) => {
     const sc = q(r.scroll);
+    // The last rendered row goes to the top: works whichever ancestor really scrolls, and makes a virtualized list render the next rows.
+    let last = null;
+    for (const it of qa(r.item)) if (rendered(it)) last = it;
+    const top0 = last ? box(last).top : 0;
     const before = sc ? sc.scrollTop : window.scrollY;
     S.clickAt = now();
-    if (sc) { sc.scrollTop = Math.min(sc.scrollTop + sc.clientHeight * 0.9, sc.scrollHeight); sc.dispatchEvent(new Event('scroll', { bubbles: true })); }
-    else window.scrollBy(0, window.innerHeight * 0.9);
-    const after = sc ? sc.scrollTop : window.scrollY;
-    return { moved: Math.abs(after - before) > 2 };
+    if (last) last.scrollIntoView({ block: 'start' });
+    let moved = last ? Math.abs(box(last).top - top0) > 2 : false;
+    if (!moved) {
+      if (sc) { sc.scrollTop = Math.min(sc.scrollTop + sc.clientHeight * 0.9, sc.scrollHeight); sc.dispatchEvent(new Event('scroll', { bubbles: true })); }
+      else window.scrollBy(0, window.innerHeight * 0.9);
+      moved = Math.abs((sc ? sc.scrollTop : window.scrollY) - before) > 2;
+    }
+    return { moved };
   };
+  const unseen = (r) => { S.keyMode = r.key; let n = 0; for (const it of qa(r.item)) if (rendered(it) && !S.seen.has(keyOf(it))) n++; return n; };
   // A new run: forget what was seen and go back to the top of the list.
   const reset = (r) => {
     S.seen = new Set(); S.cur = null;
     const sc = r ? q(r.scroll) : null;
     if (sc) { sc.scrollTop = 0; sc.dispatchEvent(new Event('scroll', { bubbles: true })); } else if (r) window.scrollTo(0, 0);
+    if (r) { const first = qa(r.item)[0]; if (first) first.scrollIntoView({ block: 'start' }); }
     return true;
   };
 
@@ -409,11 +478,11 @@ if (!window.__ae) { window.__ae = (() => {
     if (S.cur && S.cur.isConnected && rendered(S.cur)) S.seen.add(keyOf(S.cur));
     return {
       ok: true, title: clean(h ? h.textContent : '').slice(0, 120) || clean(document.title).slice(0, 120),
-      body: body.slice(0, cap), chars: body.length, url: location.href, sel: sel || (auto && d !== document.body ? selFor(d, { noLabel: true }) : ''),
+      body: body.slice(0, cap), tail: body.slice(-1500), chars: body.length, url: location.href, sel: sel || (auto && d !== document.body ? selFor(d, { noLabel: true }) : ''),
     };
   };
 
-  return { discover, verify, step, collect, scrollMore, reset, state, mark, diff, extract, token: () => S.token };
+  return { v: 5, unseen, discover, verify, step, collect, listItems, scrollMore, reset, state, mark, diff, extract, token: () => S.token };
 })(); }
 `;
 
@@ -466,6 +535,17 @@ async function waitStable(
   }
 }
 
+/** Scroll for more rows and wait (bounded) until new ones are rendered: lazy lists load them a moment later. */
+async function moreRows(page: IPage, recipe: EachRecipe, waitMs = 2500): Promise<boolean> {
+  const m = await ev<{ moved: boolean }>(page, 'scrollMore', recipe);
+  const end = Date.now() + (m?.moved ? waitMs : 600);
+  for (;;) {
+    if (await ev<number>(page, 'unseen', recipe).catch(() => 0) > 0) return true;
+    if (Date.now() >= end) return false;
+    await sleep(120);
+  }
+}
+
 export function pathPattern(pathname: string): string {
   const parts = pathname.split('/').map((p) => (p && (/\d/.test(p) || p.length > 24) ? '*' : p));
   return parts.join('/').replace(/\/+$/, '') || '/';
@@ -514,8 +594,10 @@ export async function runEach(page: IPage, opts: EachOptions = {}): Promise<Each
   const rounds = Math.max(1, opts.emptyRounds ?? 3);
   const dir = baseDir(opts);
   const empty = (verdict: EachResult['verdict'], message: string, next: string): EachResult => ({
-    ok: false, verdict, message, items: [], items_n: 0, resumed_from: 0, unread_n: 0, next,
+    ok: false, verdict, message, items: [], items_n: 0, resumed_from: 0, unread_n: 0, opened: false, scanned: 0, texts: [], next,
   });
+  const listOnly = opts.mode === 'list';
+  const filter = opts.find || opts.until ? { find: opts.find ?? null, until: opts.until ?? null } : null;
 
   let listUrl: string;
   try {
@@ -545,6 +627,7 @@ export async function runEach(page: IPage, opts: EachOptions = {}): Promise<Each
       version: 1, origin: u.origin, path_pattern: pathPattern(u.pathname), mode: 'pane',
       list: d.list, item: d.item, scroll: d.scroll, detail: opts.detail ?? '', key: d.key, created: new Date().toISOString(),
     };
+    if (listOnly) { recipe = draft; } else {
     // Open the first item: does the page survive (pane) or is it replaced (navigate)?
     const token = await ev<string>(page, 'token');
     const before = await ev<PageState>(page, 'state', '');
@@ -579,6 +662,7 @@ export async function runEach(page: IPage, opts: EachOptions = {}): Promise<Each
     }
     recipe = draft;
     writeJson(file, recipe);
+    }
   }
   if (!opts.resume) {
     await ev(page, 'reset', recipe).catch(() => undefined);
@@ -587,7 +671,7 @@ export async function runEach(page: IPage, opts: EachOptions = {}): Promise<Each
   const listLoadMs = Date.now() - t0;
 
   // ── run state (resume) and output file ────────────────────────────────
-  const stateFile = file.replace(/\.json$/, '.state.json').replace(`${path.sep}recipes${path.sep}`, `${path.sep}each${path.sep}`);
+  const stateFile = file.replace(/\.json$/, listOnly ? '.list.state.json' : '.state.json').replace(`${path.sep}recipes${path.sep}`, `${path.sep}each${path.sep}`);
   const prior = opts.resume ? readJson<RunState>(stateFile) : null;
   const seen = new Set<string>(prior?.seen ?? []);
   const resumedFrom = prior?.n ?? 0;
@@ -598,6 +682,8 @@ export async function runEach(page: IPage, opts: EachOptions = {}): Promise<Each
   let unread = prior?.unread ?? 0;
   const items: Array<Omit<EachItem, 'body'>> = [];
   const perItem: number[] = [];
+  const texts: EachResult['texts'] = [];
+  let scanned = 0;
   const persist = () => writeJson(stateFile, { seen: [...seen], save, n, unread, updated: new Date().toISOString() } satisfies RunState);
   const record = (item: EachItem) => {
     fs.appendFileSync(save, `${JSON.stringify(item)}\n`);
@@ -617,7 +703,26 @@ export async function runEach(page: IPage, opts: EachOptions = {}): Promise<Each
   };
 
   try {
-    if (recipe.mode === 'pane') {
+    if (listOnly) {
+      let seed: string[] | null = seen.size ? [...seen] : null;
+      let idle = 0;
+      for (;;) {
+        if (taken() >= limit) { verdict = 'CUT_LIMIT'; break; }
+        if (Date.now() >= deadline) { verdict = 'CUT_TIME'; break; }
+        const got = await ev<{ items: Array<{ key: string; title: string; date: string; full: string; snippet: string; unread: boolean; href: string }>; scanned: number; stop: boolean }>(page, 'listItems', recipe, seed, filter, limit - taken());
+        seed = null;
+        scanned += got.scanned;
+        for (const it of got.items) {
+          seen.add(it.key);
+          n++;
+          record({ i: n, key: it.key, list_title: it.title, date: it.date, full_date: it.full, snippet: it.snippet, title: '', url: it.href || listUrl, unread: it.unread, chars: 0, ms: 0, body: '' });
+        }
+        if (got.stop) break;
+        if (taken() >= limit) continue;
+        if (await moreRows(page, recipe)) { idle = 0; continue; }
+        if (++idle >= rounds) break;
+      }
+    } else if (recipe.mode === 'pane') {
       let seed: string[] | null = seen.size ? [...seen] : null;
       let prevHead = (await ev<PageState>(page, 'state', recipe.detail)).head;
       const seenUrls = new Set<string>();
@@ -627,13 +732,13 @@ export async function runEach(page: IPage, opts: EachOptions = {}): Promise<Each
         if (taken() >= limit) { verdict = 'CUT_LIMIT'; break; }
         if (Date.now() >= deadline) { verdict = 'CUT_TIME'; break; }
         const itemStart = Date.now();
-        const s = await ev<{ none?: boolean; key: string; title: string; unread: boolean; live: number }>(page, 'step', recipe, seed, true);
+        const s = await ev<{ none?: boolean; stop?: boolean; scanned: number; key: string; title: string; date: string; full: string; snippet: string; unread: boolean; live: number }>(page, 'step', recipe, seed, true, filter);
         seed = null;
+        scanned += s.scanned ?? 0;
+        if (s.stop) break;
         if (s.none) {
           // Scrolling past items already read (resume) is progress; only a list that stops moving counts as empty.
-          const m = await ev<{ moved: boolean }>(page, 'scrollMore', recipe);
-          await waitStable(page, '', null, { capMs: 1500, quietMs: 200 });
-          if (m?.moved && ++moves < 2000) continue;
+          if (await moreRows(page, recipe)) { idle = 0; if (++moves < 5000) continue; }
           if (++idle >= rounds) break;
           continue;
         }
@@ -641,7 +746,7 @@ export async function runEach(page: IPage, opts: EachOptions = {}): Promise<Each
         seen.add(s.key);
         await sleep(30);
         const w = await waitStable(page, recipe.detail, { head: prevHead }, { capMs: 6000, needChange: true });
-        const x = await ev<{ ok: boolean; title: string; body: string; chars: number; url: string }>(page, 'extract', recipe.detail, cap, false);
+        const x = await ev<{ ok: boolean; title: string; body: string; tail: string; chars: number; url: string }>(page, 'extract', recipe.detail, cap, false);
         if (!x.ok) {
           if (source === 'cached' && taken() === 0) throw new RecipeStale();
           message = `the detail region ${recipe.detail} disappeared at item ${n + 1}`;
@@ -653,24 +758,31 @@ export async function runEach(page: IPage, opts: EachOptions = {}): Promise<Each
         seenUrls.add(x.url);
         if (!duplicate) {
           n++;
-          record({ i: n, key: s.key, list_title: s.title, title: x.title, url: x.url, unread: s.unread, chars: x.chars, ms: Date.now() - itemStart, settle: `${w.how} ${w.ms}ms`, body: x.body });
+          if (texts.length < 3) texts.push({ i: n, chars: x.chars, text: x.tail });
+          record({ i: n, key: s.key, list_title: s.title, date: s.date, full_date: s.full, snippet: s.snippet, title: x.title, url: x.url, unread: s.unread, chars: x.chars, ms: Date.now() - itemStart, settle: `${w.how} ${w.ms}ms`, body: x.body });
         }
         if (n % 10 === 0) persist();
         await pace(itemStart);
       }
     } else {
       // navigate: collect the links first (scrolling for more), then visit each.
-      const queue: Array<{ key: string; title: string; unread: boolean; href: string }> = [];
+      const queue: Array<{ key: string; title: string; date: string; full: string; snippet: string; text: string; unread: boolean; href: string }> = [];
+      let stopped = false;
       let seed: string[] | null = seen.size ? [...seen] : null;
       let idle = 0;
-      while (queue.length < limit && Date.now() < deadline) {
+      while (queue.length < limit && Date.now() < deadline && !stopped) {
         const got = await ev<typeof queue>(page, 'collect', recipe, seed);
         seed = null;
-        queue.push(...got);
-        const m = await ev<{ moved: boolean }>(page, 'scrollMore', recipe);
-        await waitStable(page, '', null, { capMs: 1500, quietMs: 200 });
-        if (got.length > 0) idle = 0;
-        else if (!m?.moved && ++idle >= rounds) break;
+        for (const it of got) {
+          scanned++;
+          if (filter?.until && it.text.includes(filter.until.toLowerCase())) { stopped = true; break; }
+          if (filter?.find && !it.text.includes(filter.find.toLowerCase())) continue;
+          queue.push(it);
+        }
+        if (stopped) break;
+        const more = await moreRows(page, recipe);
+        if (got.length > 0 || more) idle = 0;
+        else if (++idle >= rounds) break;
       }
       for (const it of queue) {
         if (taken() >= limit) { verdict = 'CUT_LIMIT'; break; }
@@ -679,11 +791,12 @@ export async function runEach(page: IPage, opts: EachOptions = {}): Promise<Each
         const nav = page.goto(it.href, { waitUntil: 'none' }).then(() => 'done', () => 'failed');
         await Promise.race([nav, sleep(12_000)]);
         await waitStable(page, '', null, { capMs: 8000, quietMs: 250 });
-        const x = await ev<{ ok: boolean; title: string; body: string; chars: number; url: string; sel: string }>(page, 'extract', recipe.detail, cap, true);
+        const x = await ev<{ ok: boolean; title: string; body: string; tail: string; chars: number; url: string; sel: string }>(page, 'extract', recipe.detail, cap, true);
+        if (x.ok && texts.length < 3) texts.push({ i: n + 1, chars: x.chars, text: x.tail });
         if (x.ok && !recipe.detail && x.sel) { recipe.detail = x.sel; writeJson(file, recipe); }
         seen.add(it.key);
         n++;
-        record({ i: n, key: it.key, list_title: it.title, title: x.ok ? x.title : '', url: it.href, unread: it.unread, chars: x.ok ? x.chars : 0, ms: Date.now() - itemStart, body: x.ok ? x.body : '' });
+        record({ i: n, key: it.key, list_title: it.title, date: it.date, full_date: it.full, snippet: it.snippet, title: x.ok ? x.title : '', url: it.href, unread: it.unread, chars: x.ok ? x.chars : 0, ms: Date.now() - itemStart, body: x.ok ? x.body : '' });
         if (n % 10 === 0) persist();
         await pace(itemStart);
       }
@@ -707,13 +820,16 @@ export async function runEach(page: IPage, opts: EachOptions = {}): Promise<Each
     ...(message ? { message } : {}),
     recipe, recipe_source: source, recipe_file: file,
     items, items_n: items.length, resumed_from: resumedFrom, unread_n: unread,
+    opened: !listOnly, scanned, texts,
     timing: timingOf(perItem, listLoadMs, loopMs, Date.now() - t0),
     save,
     next: verdict === 'FAILED'
       ? `Read the message. ${NEXT_OVERRIDE}`
       : cut
-        ? 'More items are left: call again with resume=true (same page) to continue where this stopped.'
-        : `Finished: no new item after ${rounds} scroll rounds. Full text is in the save file. ${NEXT_OVERRIDE}`,
+        ? `${verdict === 'CUT_LIMIT' ? `Stopped at the limit (${items.length} item(s)); more rows may follow` : 'Time budget used up; more items are left'}: repeat this call with resume=true to continue where it stopped.${listOnly ? ' To read one: do=each find="<its name or date>" limit=1 (opens it).' : ''}`
+        : listOnly
+          ? `End of the list${filter ? ' or of the filter' : ''}. To open and read items: do=each find="<name or date>" limit=<n> (opening marks unread items read). ${NEXT_OVERRIDE}`
+          : `Finished${filter?.find ? `: every item matching "${filter.find}" was opened` : ''}. Full text of every item is in the save file. ${NEXT_OVERRIDE}`,
   };
 }
 
@@ -721,20 +837,28 @@ class RecipeStale extends Error {}
 
 /** Compact text for the `act` answer: selectors, one line per item, timing, file. */
 export function describeEach(r: EachResult, maxLines = 25): string {
-  const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+  const clip = (t: string, n: number) => (t.length > n ? `${t.slice(0, n - 1)}…` : t);
   if (!r.recipe) return `${r.verdict}: ${r.message ?? ''}`;
   const t = r.timing as EachTiming;
-  const head = `${r.verdict} ${r.items_n} item(s)${r.resumed_from ? ` (+${r.resumed_from} before, resumed)` : ''} in ${(t.total_ms / 1000).toFixed(1)}s, recipe ${r.recipe_source}${r.message ? ` - ${r.message}` : ''}`;
+  const what = r.opened
+    ? `OPENED ${r.items_n} item(s)`
+    : `LISTED ${r.items_n} item(s), nothing opened, nothing marked read`;
+  const head = `${r.verdict} ${what}${r.scanned > r.items_n ? `, ${r.scanned} rows looked at` : ''}${r.resumed_from ? ` (+${r.resumed_from} before, resumed)` : ''} in ${(t.total_ms / 1000).toFixed(1)}s, recipe ${r.recipe_source}${r.message ? ` - ${r.message}` : ''}`;
+  const when = (it: EachResult['items'][number]) => (it.date || it.full_date ? ` [${[it.date, it.full_date].filter(Boolean).join(' = ')}]` : '');
   const lines = [
     head,
     `LIST   ${r.recipe.item}${r.recipe.scroll ? `   scroll ${r.recipe.scroll}` : ''}`,
-    `DETAIL ${r.recipe.detail || '(largest main/article of each page)'}   mode ${r.recipe.mode}, key ${r.recipe.key}`,
-    ...r.items.slice(0, maxLines).map((it) => `${it.i} "${clip(it.list_title, 40)}" -> "${clip(it.title, 40)}" ${it.chars} chars ${it.ms}ms${it.unread ? ' UNREAD' : ''}`),
+    ...(r.opened ? [`DETAIL ${r.recipe.detail || '(largest main/article of each page)'}   mode ${r.recipe.mode}, key ${r.recipe.key}`] : []),
+    ...r.items.slice(0, maxLines).map((it) => (r.opened
+      ? `${it.i} "${clip(it.list_title, 40)}"${when(it)} -> "${clip(it.title, 40)}" ${it.chars} chars ${it.ms}ms${it.unread ? ' UNREAD' : ''}`
+      : `${it.i} "${clip(it.list_title, 40)}"${when(it)} ${clip(it.snippet ?? '', 90)}${it.unread ? ' UNREAD' : ''}`)),
   ];
-  if (r.items.length > maxLines) lines.push(`… ${r.items.length - maxLines} more in the file`);
-  if (r.unread_n > 0) lines.push(`UNREAD ${r.unread_n} item(s) showed an unread marker; opening them marked them as read on the site.`);
-  lines.push(`TIMING list load ${t.list_load_ms}ms | per item median ${t.median_ms}ms p90 ${t.p90_ms}ms max ${t.max_ms}ms | ${t.items_per_min} items/min`);
+  if (r.items.length > maxLines) lines.push(`… ${r.items.length - maxLines} more lines not shown (raise max, or narrow with find)`);
+  if (r.items_n === 0) lines.push('(no item matched)');
+  if (r.opened && r.items_n <= 3) for (const x of r.texts) lines.push(`TEXT ${x.i} (${x.chars > x.text.length ? `the last ${x.text.length} of ${x.chars} chars; newest content is at the end` : `${x.chars} chars`})`, x.text);
+  if (r.opened && r.unread_n > 0) lines.push(`UNREAD ${r.unread_n} item(s) showed an unread marker; opening them marked them as read on the site.`);
+  if (r.opened) lines.push(`TIMING list load ${t.list_load_ms}ms | per item median ${t.median_ms}ms p90 ${t.p90_ms}ms max ${t.max_ms}ms | ${t.items_per_min} items/min`);
   lines.push(`SAVED  ${r.save}`);
-  lines.push(`RECIPE ${r.recipe_file}`);
+  if (r.opened) lines.push(`RECIPE ${r.recipe_file}`);
   return lines.join('\n');
 }

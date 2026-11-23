@@ -5,7 +5,7 @@
  * and answer with a result line followed by the screen (what can be clicked
  * next). The caller never needs a second call just to read the page.
  *
- *   OK click 9 -> PASS (changed: dialog/menu) 412ms
+ *   OK click 9 -> PASS, page changed (dialog/menu) 412ms
  *   PAGE … | …
  *   OPTIONS n
  *   <ref> <role> "<name>"
@@ -71,6 +71,10 @@ export interface ActInput {
   save?: string;
   /** each: ignore the cached recipe and discover the list again. */
   rediscover?: boolean;
+  /** each: "list" only reports the rows (name, date, snippet) and opens nothing; default opens each item. */
+  mode?: 'open' | 'list';
+  /** look: skip this many options (paging). */
+  offset?: number;
 }
 
 export interface ActPlan {
@@ -120,6 +124,8 @@ export function parseActInput(raw: unknown): ActInput | ActPlan | string {
   if (a.convert !== undefined && a.convert !== 'png' && a.convert !== 'jpeg') return 'convert must be png or jpeg';
   if (a.max_px !== undefined && !(typeof a.max_px === 'number' && a.max_px >= 16)) return 'max_px must be a number >= 16';
   if (a.lease !== undefined && a.lease !== 'task') return 'lease must be "task"';
+  if (a.mode !== undefined && a.mode !== 'open' && a.mode !== 'list') return 'mode must be open or list';
+  if (a.offset !== undefined && !(typeof a.offset === 'number' && a.offset >= 0)) return 'offset must be a number >= 0';
   for (const k of ['limit', 'min_interval_ms', 'time_budget']) {
     if (a[k] !== undefined && !(typeof a[k] === 'number' && (a[k] as number) >= 0)) return `${k} must be a number >= 0`;
   }
@@ -139,8 +145,10 @@ export function parseActInput(raw: unknown): ActInput | ActPlan | string {
 }
 
 async function screen(page: IPage, input: ActInput): Promise<string> {
-  const map = await preciseTargets(page, {});
-  return renderScreen(map, { max: input.max, find: input.do === 'look' ? input.find : undefined });
+  // find looks at every clickable element of the page, also those scrolled out of view.
+  const find = input.do === 'each' || input.do === 'wait' ? undefined : input.find;
+  const map = await preciseTargets(page, { max: 1000, all: !!find });
+  return renderScreen(map, { max: input.max, find, offset: input.do === 'look' ? input.offset : undefined });
 }
 
 /** Poll until the page has clickable elements and the count stopped changing, or the budget ends. */
@@ -204,6 +212,76 @@ function waitConditionJs(input: ActInput): string {
   `;
 }
 
+/** Scroll the target's scrollable region, or the region in the middle of the window when the page itself cannot scroll. */
+/** Page-side: mark the region (list, pane) whose aria-label or title matches, return a selector for it. */
+function regionByLabelJs(label: string): string {
+  return `
+    (() => {
+      const want = ${JSON.stringify(label.replace(/^[a-z]+:/i, '').trim().toLowerCase())};
+      const name = (el) => ((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '')).trim().toLowerCase();
+      const all = Array.from(document.querySelectorAll('[aria-label],[title]')).filter((el) => { const r = el.getBoundingClientRect(); return r.width > 40 && r.height > 40; });
+      const hit = all.find((el) => name(el) === want) || all.find((el) => name(el).includes(want));
+      if (!hit) return null;
+      for (const el of document.querySelectorAll('[data-aira-region]')) el.removeAttribute('data-aira-region');
+      hit.setAttribute('data-aira-region', '1');
+      return '[data-aira-region="1"]';
+    })()
+  `;
+}
+
+function scrollJs(target: string | undefined, dir: 'up' | 'down'): string {
+  return `
+    (() => {
+      const t = ${JSON.stringify(target ?? null)}, sign = ${dir === 'up' ? -1 : 1};
+      const can = (el) => {
+        if (!el || el === document.body || el === document.documentElement) return false;
+        let oy = ''; try { oy = getComputedStyle(el).overflowY; } catch (e) {}
+        return (oy === 'auto' || oy === 'scroll' || oy === 'overlay') && el.scrollHeight > el.clientHeight + 20;
+      };
+      const up = (el) => { for (let a = el; a; a = a.parentElement) if (can(a)) return a; return null; };
+      const doc = document.scrollingElement || document.documentElement;
+      const pageCan = doc.scrollHeight > window.innerHeight + 20;
+      let el = null, why = '';
+      if (t !== null) {
+        let start = null;
+        const xy = /^(\\d+)\\s*,\\s*(\\d+)$/.exec(t);
+        if (xy) start = document.elementFromPoint(Number(xy[1]), Number(xy[2]));
+        else if (/^\\d+$/.test(t)) start = document.querySelector('[data-opencli-ref="' + t + '"]');
+        else { try { start = document.querySelector(t); } catch (e) {} }
+        if (!start) return { error: 'target not found: ' + t };
+        el = up(start);
+        if (!el && !pageCan) return { error: 'nothing around target ' + t + ' can scroll' };
+        why = el ? 'region of the target' : 'target is not in a scrollable region, so the page scrolled';
+      } else if (!pageCan) {
+        el = up(document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2));
+        why = 'the page itself cannot scroll, so the region in the middle of the window was scrolled';
+        if (!el) {
+          let best = 0;
+          for (const c of document.querySelectorAll('*')) { if (!can(c)) continue; const r = c.getBoundingClientRect(); const a = r.width * r.height; if (a > best) { best = a; el = c; } }
+          why = 'the page itself cannot scroll, so its largest scrollable region was scrolled';
+        }
+        if (!el) return { error: 'nothing on this page can scroll' };
+      }
+      const rows = (root) => { let n = 0; for (const r of root.querySelectorAll('li,[role="listitem"],[role="row"],[role="option"],article')) { const b = r.getBoundingClientRect(); if (b.height > 8 && (r.textContent || '').trim().length > 1) n++; } return n; };
+      const label = (e) => e.tagName.toLowerCase() + (e.getAttribute('aria-label') ? ' "' + e.getAttribute('aria-label').slice(0, 40) + '"' : e.getAttribute('role') ? ' [' + e.getAttribute('role') + ']' : e.id ? '#' + e.id : '');
+      const node = el || doc;
+      const before = node.scrollTop, n0 = rows(el || document.body);
+      const step = Math.round((el ? el.clientHeight : window.innerHeight) * 0.85) * sign;
+      if (el) { el.scrollTop = before + step; el.dispatchEvent(new Event('scroll', { bubbles: true })); } else window.scrollBy(0, step);
+      window.__aira_scrolled = { el, rows };
+      return { region: el ? label(el) : 'page', why, before, n0 };
+    })()
+  `;
+}
+
+const SCROLL_AFTER_JS = `
+  (() => {
+    const s = window.__aira_scrolled || {};
+    const node = s.el || document.scrollingElement || document.documentElement;
+    return { after: node.scrollTop, n1: s.rows ? s.rows(s.el || document.body) : 0, max: node.scrollHeight - node.clientHeight };
+  })()
+`;
+
 function readJs(target: string | undefined, limit: number): string {
   return `
     (() => {
@@ -214,7 +292,9 @@ function readJs(target: string | undefined, limit: number): string {
         if (!el) return null;
       }
       const text = (el.innerText || el.textContent || '').replace(/[ \\t]+/g, ' ').replace(/\\n{3,}/g, '\\n\\n').trim();
-      return text.length > ${limit} ? '…' + text.slice(-${limit}) : text;
+      const label = el.getAttribute('aria-label') || el.getAttribute('role') || '';
+      const region = t === null ? 'the whole page' : el.tagName.toLowerCase() + (label ? ' "' + label.slice(0, 40) + '"' : '');
+      return { text: text.length > ${limit} ? '…' + text.slice(-${limit}) : text, total: text.length, region };
     })()
   `;
 }
@@ -240,7 +320,8 @@ async function hiddenWhy(page: IPage): Promise<string> {
 
 /** Upload answer for the agent: verdict and count on success, the per-strategy lines only on failure. */
 export function uploadLine(r: SmartUploadResult): string {
-  return r.verdict === 'PASS' ? `PASS attached ${r.files.length} of ${r.files.length}` : describeUpload(r);
+  if (r.verdict !== 'PASS') return describeUpload(r);
+  return `PASS attached ${r.files.length} of ${r.files.length}${r.already ? ` (the page already showed ${r.already} image or attachment preview(s) before this call: check for duplicates)` : ''}`;
 }
 
 /** Screenshots go next to the logs, a place the calling agent can read. */
@@ -372,8 +453,13 @@ async function actInner(page: IPage, input: ActInput, opts: { screen?: boolean }
   try {
     if (target !== undefined && /^label:/i.test(target) && input.do !== 'save') {
       const found = await resolveLabel(page, target.slice(6));
-      if (typeof found !== 'string') return fail(found.error, found.next);
-      target = found;
+      if (typeof found === 'string') target = found;
+      else if (input.do === 'scroll') {
+        // A list or pane is not a clickable option: find it by its accessible name instead.
+        const sel = await page.evaluate(regionByLabelJs(target.slice(6))) as string | null;
+        if (!sel) return fail(`no option or region labelled "${target.slice(6)}"`, 'Call do=scroll without target (the list under the middle of the screen scrolls), or pass the ref of any row inside the list.');
+        target = sel;
+      } else return fail(found.error, found.next);
     }
     switch (input.do) {
       case 'open': {
@@ -397,8 +483,15 @@ async function actInner(page: IPage, input: ActInput, opts: { screen?: boolean }
           r.verdict === 'MISSED' && r.landed_on ? `landed on ${r.landed_on}` : '',
           r.message ?? '',
         ].filter(Boolean).join('; ');
-        const via = r.click_method === 'dom' ? ' via dom (hidden page, untrusted)' : '';
-        const head = `${good ? 'OK' : 'ERR'} click ${target} -> ${r.verdict}${via}${detail ? ` (${detail})` : ''} ${ms()}`;
+        const via = r.click_method === 'dom' ? ' [in-page click: the page is hidden]' : '';
+        const seen = r.changed ?? [];
+        const effect = r.verdict === 'PASS'
+          ? (seen.every((c) => c === 'focus')
+            ? 'PASS, clicked; only the focus moved, the page content looks the same (it may already have been in that state)'
+            : `PASS, page changed (${seen.join(', ')})`)
+          : r.verdict === 'NO_CHANGE' ? 'clicked, no change seen' : r.verdict;
+        const extra = r.verdict === 'PASS' ? '' : detail;
+        const head = `${good ? 'OK' : 'ERR'} click ${target} -> ${effect}${extra ? ` (${extra})` : ''}${via} ${ms()}`;
         return { ok: good, text: `${head}${r.verdict === 'PASS' ? '' : `\nNEXT ${hintFor(`${r.verdict} ${detail}`, r.next)}`}${await tail()}` };
       }
       case 'type': {
@@ -448,14 +541,27 @@ async function actInner(page: IPage, input: ActInput, opts: { screen?: boolean }
         return { ok: met, text: `${head}${await tail()}` };
       }
       case 'scroll': {
-        await page.scroll(input.direction ?? 'down', 600);
-        await sleep(200);
-        return { ok: true, text: `OK scroll ${input.direction ?? 'down'} ${ms()}${await tail()}` };
+        const dir = input.direction ?? 'down';
+        const a = await page.evaluate(scrollJs(target, dir)) as { error?: string; region: string; why: string; before: number; n0: number };
+        if (a.error) return fail(`scroll ${dir}: ${a.error}`, 'Pass target=<ref of an element inside the list or pane to scroll> (see OPTIONS), or omit target to scroll the region in the middle of the window.');
+        await sleep(350);
+        const b = await page.evaluate(SCROLL_AFTER_JS) as { after: number; n1: number; max: number };
+        const moved = Math.round(b.after - a.before);
+        if (moved === 0) {
+          return fail(`scroll ${dir}: nothing scrolled (${a.region} is already at its ${dir === 'down' ? 'end' : 'top'}, at ${Math.round(b.after)} of ${Math.round(b.max)} px)`,
+            `To scroll another region pass target=<ref of an element inside it>. To read or search every row of a list or inbox use do=each mode=list (it scrolls by itself).`);
+        }
+        return { ok: true, text: `OK scroll ${dir}: ${a.region} ${moved > 0 ? '+' : ''}${moved} px (now at ${Math.round(b.after)} of ${Math.round(b.max)}), ${a.n0} -> ${b.n1} rows${a.why ? ` [${a.why}]` : ''} ${ms()}${await tail()}` };
       }
       case 'read': {
-        const text = await page.evaluate(readJs(target, Math.min(Math.max(input.max ?? 1500, 100), 8000))) as string | null;
-        if (text === null) return fail(`read target not found: ${target}`, 'Call look for fresh refs.');
-        return { ok: true, text: `OK read ${ms()}\n${text}` };
+        const limit = Math.min(Math.max(input.max ?? 1500, 100), 8000);
+        const got = await page.evaluate(readJs(target, limit)) as { text: string; total: number; region: string } | null;
+        if (got === null) return fail(`read target not found: ${target}`, 'Call look for fresh refs.');
+        const part = got.total > limit ? `the LAST ${limit} of ${got.total} chars (max=<n> up to 8000 shows more)` : `${got.total} chars`;
+        const hint = target === undefined
+          ? ' No target was given, so this is all visible text of the page in reading order; on a list/detail page it ends with the open detail pane. One region: target=<ref or CSS selector>. The rows of a list or inbox: do=each mode=list.'
+          : '';
+        return { ok: true, text: `OK read ${got.region}: ${part}.${hint} ${ms()}\n${got.text}` };
       }
       case 'images': {
         const list = await page.evaluate(IMAGES_JS) as Array<{ i: number; src: string; w: number; h: number; alt: string; visible: boolean }>;
@@ -488,6 +594,7 @@ async function actInner(page: IPage, input: ActInput, opts: { screen?: boolean }
         // Read-only walk over a list: opens items in-page, never types or submits, needs no foreground.
         const r = await runEach(page, {
           target: input.target === undefined ? undefined : String(input.target), detail: input.selector,
+          mode: input.mode, find: input.find, until: input.until,
           limit: input.limit, minIntervalMs: input.min_interval_ms, timeBudgetS: input.time_budget,
           resume: input.resume, save: input.save, rediscover: input.rediscover,
         });
@@ -504,7 +611,7 @@ async function actInner(page: IPage, input: ActInput, opts: { screen?: boolean }
           state = `STATE tab ${s.v}${s.f ? ', focused' : ''}, ${s.r} | ${s.u.slice(0, 120)}\n`
             + (s.v === 'visible'
               ? 'INPUT trusted clicks and typing reach this tab.'
-              : `INPUT page is hidden (${await hiddenWhy(page)}). Nothing is brought to the front. Clicks run inside the page ("via dom", untrusted, still verified); typed text arrives; keys are sent as in-page events, so click the Send/OK button instead of pressing Enter. If a site insists on a real click, the user can start the server with --window foreground.`);
+              : `INPUT page is hidden (${await hiddenWhy(page)}). Nothing is brought to the front. Clicks run inside the page (marked "[in-page click]", untrusted, effect still verified); typed text arrives; keys are sent as in-page events, so click the Send/OK button instead of pressing Enter. If a site insists on a real click, the user can start the server with --window foreground.`);
         } catch { /* keep the default line */ }
         return { ok: true, text: `${state}${lastUploadDetail ? `\nLAST UPLOAD ${lastUploadDetail}` : ''}\n${readLog(input.max ?? 10)}` };
       }

@@ -63,11 +63,13 @@ describe('each: loop', () => {
     const page = fakePage({
       verify: () => ({ live: 3, total: 3, scrollOk: true, token: 't' }),
       step: () => (opened + 1 < list.length
-        ? { key: `t:${list[++opened]}`, title: list[opened], unread: opened === 1, live: 3, total: 3 }
-        : { none: true, live: 3, total: 3 }),
+        ? { key: `t:${list[++opened]}`, title: list[opened], unread: opened === 1, live: 3, total: 3, scanned: 1, date: '', full: '', snippet: '' }
+        : { none: true, live: 3, total: 3, scanned: 0 }),
       state: () => ({ now: (clock += 1000), last: 0, clickAt: 0, len: 10, head: `h${opened}`, url: 'https://example.test/inbox/', busy: false, pending: 0, ready: 'complete', found: true, token: 't' }),
       extract: () => ({ ok: true, title: `Chat with ${list[opened]}`, body: `hello from ${list[opened]}`, chars: 14, url: 'https://example.test/inbox/' }),
       scrollMore: () => ({ moved: false }),
+      unseen: () => 0,
+      reset: () => true,
     });
     const r = await runEach(page, { dir, minIntervalMs: 0, emptyRounds: 2 });
     expect(r).toMatchObject({ ok: true, verdict: 'DONE', recipe_source: 'cached', items_n: 3, unread_n: 1 });
@@ -75,7 +77,7 @@ describe('each: loop', () => {
     const rows = fs.readFileSync(r.save as string, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
     expect(rows.map((x) => x.body)).toEqual(['hello from Ann', 'hello from Bob', 'hello from Cy']);
     const text = describeEach(r);
-    expect(text).toContain('DONE 3 item(s)');
+    expect(text).toContain('DONE OPENED 3 item(s)');
     expect(text).toContain('recipe cached');
     expect(text).toContain('TIMING list load');
     expect(text).toContain('UNREAD 1 item(s)');
@@ -88,13 +90,47 @@ describe('each: loop', () => {
     let clock = 0;
     const page = fakePage({
       verify: () => ({ live: 5, total: 5, scrollOk: true, token: 't' }),
-      step: () => ({ key: `t:${++n}`, title: `item ${n}`, unread: false, live: 5, total: 5 }),
+      step: () => ({ key: `t:${++n}`, title: `item ${n}`, unread: false, live: 5, total: 5, scanned: 1, date: '', full: '', snippet: '' }),
+      reset: () => true,
       state: () => ({ now: (clock += 1000), last: 0, clickAt: 0, len: 10, head: `h${n}`, url: 'u', busy: false, pending: 0, ready: 'complete', found: true, token: 't' }),
       extract: () => ({ ok: true, title: `T${n}`, body: 'b', chars: 1, url: 'https://example.test/inbox/' }),
     });
     const r = await runEach(page, { dir, minIntervalMs: 0, limit: 2 });
     expect(r).toMatchObject({ verdict: 'CUT_LIMIT', items_n: 2 });
     expect(r.next).toContain('resume=true');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('list mode returns the rows with dates and opens nothing', async () => {
+    const dir = withRecipe(recipe);
+    let clock = 0;
+    let served = false;
+    const page = fakePage({
+      verify: () => ({ live: 2, total: 2, scrollOk: true, token: 't' }),
+      reset: () => true,
+      state: () => ({ now: (clock += 1000), last: 0, clickAt: 0, len: 10, head: 'h', url: 'u', busy: false, pending: 0, ready: 'complete', found: true, token: 't' }),
+      listItems: () => {
+        if (served) return { items: [], scanned: 0, stop: false };
+        served = true;
+        return {
+          items: [
+            { key: 't:Ann', title: 'Ann', date: 'Dec 10, 2025', full: '', snippet: 'see you then', unread: true, href: '' },
+            { key: 't:Bob', title: 'Bob', date: 'Nov 3', full: '2026-11-03', snippet: 'thanks', unread: false, href: '' },
+          ],
+          scanned: 9, stop: false,
+        };
+      },
+      scrollMore: () => ({ moved: false }),
+      unseen: () => 0,
+    });
+    const r = await runEach(page, { dir, mode: 'list', find: 'x', emptyRounds: 1 });
+    expect(r).toMatchObject({ ok: true, verdict: 'DONE', opened: false, items_n: 2, scanned: 9 });
+    expect(page.calls).not.toContain('step');
+    expect(page.calls).not.toContain('extract');
+    const text = describeEach(r);
+    expect(text).toContain('LISTED 2 item(s), nothing opened, nothing marked read');
+    expect(text).toContain('[Dec 10, 2025]');
+    expect(text).toContain('2026-11-03');
     fs.rmSync(dir, { recursive: true, force: true });
   });
 

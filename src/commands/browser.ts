@@ -1513,6 +1513,9 @@ export function registerBrowserCommands(program: Command): Command {
     .option('--target <selector>', 'List container or item selector, when the guess is wrong')
     .option('--detail <selector>', 'Detail region selector, when the guess is wrong')
     .option('--limit <n>', 'Stop after this many items')
+    .option('--list', 'Only list the rows (name, date, snippet); open nothing, mark nothing read', false)
+    .option('--find <text>', 'Only rows whose text or date contains this')
+    .option('--until <text>', 'Stop at the first row whose text or date contains this')
     .option('--min-interval <ms>', 'Minimum time between two items', '300')
     .option('--time-budget <s>', 'Seconds this call may run', '100')
     .option('--resume', 'Continue the previous run', false)
@@ -1525,6 +1528,7 @@ export function registerBrowserCommands(program: Command): Command {
       const result = await runEach(page, {
         target: opts.target, detail: opts.detail, limit: num(opts.limit), minIntervalMs: num(opts.minInterval),
         timeBudgetS: num(opts.timeBudget), resume: opts.resume === true, rediscover: opts.rediscover === true, save: opts.save,
+        mode: opts.list === true ? 'list' : 'open', find: opts.find, until: opts.until,
       });
       if (opts.json) emitResult(result); else console.log(`${describeEach(result, 40)}\nNEXT ${result.next}`);
       if (!result.ok) process.exitCode = EXIT_CODES.GENERIC_ERROR;

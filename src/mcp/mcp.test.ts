@@ -56,7 +56,15 @@ describe('screen', () => {
 
   it('filters by find and caps the list', () => {
     expect(renderScreen({ ...MAP, next: '' }, { find: 'send' })).toContain('OPTIONS 1 matching "send"');
-    expect(renderScreen({ ...MAP, next: '' }, { max: 1 })).toContain('OPTIONS 1 of 3');
+    expect(renderScreen({ ...MAP, next: '' }, { max: 1 })).toContain('OPTIONS 1-1 of 3');
+  });
+
+  it('says so when find matches nothing, and pages with offset', () => {
+    expect(renderScreen({ ...MAP, next: '' }, { find: 'zzzz' })).toContain('OPTIONS 0 matches of 3 for "zzzz"');
+    const page2 = renderScreen({ ...MAP, next: '' }, { max: 1, offset: 1 });
+    expect(page2).toContain('OPTIONS 2-2 of 3');
+    expect(page2).toContain('2 textbox "Ask anything"');
+    expect(page2).toContain('MORE do=look offset=2');
   });
 });
 
@@ -176,6 +184,7 @@ describe('agent-proofing', () => {
   it('prints only the verdict and count for a successful upload', () => {
     const ok = { verdict: 'PASS', strategy: 'capture', files: ['/a.png', '/b.png'], evidence: 'image previews +4', attempts: [{ strategy: 'input', ok: false, detail: 'Chrome refused' }], next: '' };
     expect(uploadLine(ok as never)).toBe('PASS attached 2 of 2');
+    expect(uploadLine({ ...ok, already: 4 } as never)).toContain('already showed 4');
     const bad = { ...ok, verdict: 'FAILED', strategy: undefined };
     expect(uploadLine(bad as never)).toContain('input: no - Chrome refused');
   });
@@ -306,7 +315,8 @@ describe('smart upload', () => {
     (page as unknown as { setFileInput: unknown }).setFileInput = async () => { throw new Error('{"code":-32000,"message":"Not allowed"}'); };
     const r = await smartUpload(page, [file], { only: ['input'] });
     expect(r.verdict).toBe('FAILED');
-    expect(r.attempts[0].detail).toContain('file-chooser interception');
-    expect(r.next).toContain('extension must be reloaded');
+    expect(r.attempts[0].detail).toContain('Chrome refused to set files through the debugger');
+    expect(r.attempts[0].detail).toContain('setting the files in the page also failed');
+    expect(r.next).not.toMatch(/extension/i);
   });
 });

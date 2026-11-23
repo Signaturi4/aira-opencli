@@ -50,6 +50,9 @@ export function hintFor(message: string, fallback = 'Call do=look to see the pag
 
 export const PLAYBOOK = [
   'HOW TO USE act',
+  'Lists first: to read or search the rows of a list, inbox or result page use do=each (mode=list opens nothing; find=<text> limit=1 opens the first match and returns its text). Do not scroll and look for that.',
+  'OPTIONS shows 40 lines at a time: do=look offset=40 for the next ones, do=look find=<word> to narrow. do=scroll target=<ref> scrolls the pane that holds that element.',
+  'do=queue shows who holds the visible tab; lease="task" keeps it for a multi-step task until do=done.',
   '1. do=open url=… → read OPTIONS.',
   '2. Pick a ref (or label:<name>) and act: click / type / upload / key.',
   '3. Every answer already lists the new OPTIONS; do not call look after an OK answer.',
@@ -58,7 +61,7 @@ export const PLAYBOOK = [
   '6. Result files: do=images then do=save target=<index> path=<file>.',
   '',
   'EACH (read every item of a list)',
-  'do=each on a page with a list (inbox, search results, feed) opens each item, waits until its detail is stable and saves title + text to a JSON-lines file; the answer has one line per item, the selectors it used, a TIMING block and the file. No selectors needed. Options: limit, time_budget (s, default 100; continue with resume=true), min_interval_ms (default 300), save=<file>, target=<list or item selector> and selector=<detail selector> to override, rediscover=true. It only opens items: on sites with unread markers, opening marks them read.',
+  'do=each on a page with a list (inbox, search results, feed) opens each item, waits until its detail is stable and saves title + text to a JSON-lines file; the answer has one line per item, the selectors it used, a TIMING block and the file. No selectors needed. Options: limit, time_budget (s, default 100; continue with resume=true), min_interval_ms (default 300), save=<file>, target=<list or item selector> and selector=<detail selector> to override, rediscover=true. mode=list reports the rows only (name, date with the full date when the page holds it, snippet) and opens nothing. find=<text> keeps rows containing the text, until=<text> stops the walk there; with find, only matching rows are opened. When 3 or fewer items are opened the answer includes the end of their text. Opening marks unread items read on sites with unread markers; mode=list does not.',
   '',
   'QUEUE',
   'Only one session per Chrome profile uses the visible tab at a time (click, type, key, upload, shot). Others wait in line; the result then says "waited 3.2 s for session X". look, read, wait, images and each never wait. For a multi-step task that must not be interleaved, add lease="task" to the first call and finish with do=done. do=queue shows holder and waiters.',
@@ -72,7 +75,7 @@ export const PLAYBOOK = [
   '- OPTIONS is empty        → the page is loading: do=wait selector=<css> or seconds=2.',
   '- Wrong page / tab gone   → do=open again.',
   '- Screenshots are rarely needed: OPTIONS already lists what can be clicked and do=read gives the text. do=shot saves a PNG under ~/.opencli/aira-mcp/shots/ and prints the path.',
-  '- Hidden page (Chrome covered by another app, or tab not active): nothing is brought to the front. Clicks run inside the page and are marked "via dom"; typing works; real key presses are not delivered, so click the Send/OK button instead of pressing Enter.',
+  '- Hidden page (Chrome covered by another app, or tab not active): nothing is brought to the front. Clicks run inside the page and are marked "[in-page click]"; the answer still says whether the page changed. Uploads work hidden (files are dropped into the page); typing works; real key presses are not delivered, so click the Send/OK button instead of pressing Enter.',
   '- Same error twice        → do=debug, report the last lines to the user; do not loop.',
 ].join('\n');
 
