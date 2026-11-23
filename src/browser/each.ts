@@ -758,7 +758,7 @@ export async function runEach(page: IPage, opts: EachOptions = {}): Promise<Each
         seenUrls.add(x.url);
         if (!duplicate) {
           n++;
-          if (texts.length < 3) texts.push({ i: n, chars: x.chars, text: x.tail });
+          if (texts.length < 3) texts.push({ i: n, chars: x.chars, text: x.tail ?? '' });
           record({ i: n, key: s.key, list_title: s.title, date: s.date, full_date: s.full, snippet: s.snippet, title: x.title, url: x.url, unread: s.unread, chars: x.chars, ms: Date.now() - itemStart, settle: `${w.how} ${w.ms}ms`, body: x.body });
         }
         if (n % 10 === 0) persist();
@@ -792,7 +792,7 @@ export async function runEach(page: IPage, opts: EachOptions = {}): Promise<Each
         await Promise.race([nav, sleep(12_000)]);
         await waitStable(page, '', null, { capMs: 8000, quietMs: 250 });
         const x = await ev<{ ok: boolean; title: string; body: string; tail: string; chars: number; url: string; sel: string }>(page, 'extract', recipe.detail, cap, true);
-        if (x.ok && texts.length < 3) texts.push({ i: n + 1, chars: x.chars, text: x.tail });
+        if (x.ok && texts.length < 3) texts.push({ i: n + 1, chars: x.chars, text: x.tail ?? '' });
         if (x.ok && !recipe.detail && x.sel) { recipe.detail = x.sel; writeJson(file, recipe); }
         seen.add(it.key);
         n++;

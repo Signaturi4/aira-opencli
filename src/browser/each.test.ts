@@ -106,7 +106,7 @@ describe('each: loop', () => {
     let clock = 0;
     let served = false;
     const page = fakePage({
-      verify: () => ({ live: 2, total: 2, scrollOk: true, token: 't' }),
+      verify: () => ({ live: 3, total: 3, scrollOk: true, token: 't' }),
       reset: () => true,
       state: () => ({ now: (clock += 1000), last: 0, clickAt: 0, len: 10, head: 'h', url: 'u', busy: false, pending: 0, ready: 'complete', found: true, token: 't' }),
       listItems: () => {
