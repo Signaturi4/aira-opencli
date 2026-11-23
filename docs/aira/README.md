@@ -56,6 +56,26 @@ OPTIONS 23
 A whole plan in one call: `{"steps":[{"do":"click","target":"label:New chat"},{"do":"type","target":"label:textbox:Ask Gemini","text":"...","submit":true}]}`.
 Steps run in order with no model round trip in between; the run stops at the first `ERR` and says which steps were not run.
 
+## Read every item of a list: `act do=each` / `browser each`
+
+Open a page with a list (inbox, search results, catalogue) and call `do=each`. No selectors are needed.
+
+1. **List**: the largest group of 5 or more similar siblings that can be opened, with its scroll container.
+2. **Detail**: it opens two items and takes the region that changed (a pane in the same page), or switches to navigate mode when opening an item replaces the page.
+3. **Selectors** come from ids, roles, `data-testid`, ARIA labels and structure, not generated class names. The answer prints them (`LIST`, `DETAIL`); override with `target=` (list or items) and `selector=` (detail) plus `rediscover=true`.
+4. **Loop**: first unseen rendered item (seen-set by link or text, never by index, so virtualized lists work), in-page click, wait until the detail changed and stayed quiet (DOM, requests in flight, busy markers; no fixed sleeps), save title + text, scroll for more, stop after 3 rounds without a new item.
+5. **Recipe** is cached per origin + path pattern in `~/.opencli/aira-mcp/recipes/` and re-verified on use; a stale one is discovered again.
+
+Options: `limit`, `time_budget` (seconds, default 100; continue with `resume=true`), `min_interval_ms` (default 300, the floor between two items), `save=<file>` (JSON lines, one item per line; default under `~/.opencli/aira-mcp/each/`).
+
+The answer is one line per item, a `TIMING` block (list load, per item median / p90 / max, items per minute) and the file path. It is read-only: it only opens items and never types or submits. It works on a hidden tab and does not take the foreground queue. On sites with unread markers, opening an item marks it read; the answer says how many.
+
+## Foreground queue and hidden pages
+
+- One session per Chrome profile uses the visible tab at a time (click, type, key, upload, shot). Others wait in the daemon queue; the answer then says `waited 3.2 s for session X`. `do=queue` / `browser queue` shows holder and waiters; `lease:"task"` keeps the lane across calls until `do=done`. A lease ends when its process dies or after 20 s (action) / 120 s (task) without a command.
+- A page is `hidden` when its tab is not the active one **or** when another app covers the Chrome window (macOS occlusion). Nothing is raised by default: clicks then run in the page (`via dom (hidden page, untrusted)`), text goes through `insertText`, keys are checked and fall back to in-page events. `--window foreground` (or `OPENCLI_WINDOW=foreground`) opts into activating the tab and raising Chrome; `OPENCLI_INPUT_GUARD=strict` refuses instead.
+- `OPTIONS` leaves out unnamed wrappers and inner copies of one control; `browser targets` still lists them with `noise: true`.
+
 ## Click verdicts
 
 `PASS`, `NO_CHANGE` (clicked, nothing changed), `EXPECT_FAILED`, `MISSED` (another element got the click), `REFUSED_COVERED`, `REFUSED_NOT_CLICKABLE`, `REFUSED_NOT_VISIBLE`, `NOT_FOUND`, `NO_NATIVE_CLICK`.

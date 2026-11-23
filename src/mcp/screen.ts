@@ -43,7 +43,7 @@ export function renderScreen(map: PreciseTargetsResult, opts: ScreenOptions = {}
   const needle = opts.find?.trim().toLowerCase();
   const pool = needle
     ? map.targets.filter((t) => `${t.role} ${t.tag} ${t.name}`.toLowerCase().includes(needle))
-    : map.targets;
+    : map.targets.filter((t) => !t.noise);
   const shown = pool.slice(0, max);
   const lines = [
     `PAGE ${clip(map.title || '(untitled)', 60)} | ${clip(map.url, 120)}`,

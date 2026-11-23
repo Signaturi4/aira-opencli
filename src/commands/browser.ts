@@ -16,6 +16,7 @@ import { describeForeground, type FgStatusLane } from '../foreground-queue.js';
 import { profileRouteParams, resolveProfileSelection, type ProfileSelection } from '../browser/profile.js';
 import { preciseAt, preciseClick, preciseTargets, readPreciseLog } from '../browser/precise.js';
 import { smartUpload, type UploadStrategy } from '../browser/upload.js';
+import { describeEach, runEach } from '../browser/each.js';
 import { resolveLabel } from '../mcp/actions.js';
 import { parseFilter, shapeMatchesFilter } from '../browser/shape-filter.js';
 import { inferShape } from '../browser/shape.js';
@@ -1506,6 +1507,27 @@ export function registerBrowserCommands(program: Command): Command {
       });
       emitResult(result);
       if (result.verdict !== 'PASS') process.exitCode = EXIT_CODES.GENERIC_ERROR;
+    }));
+
+  addBrowserTabOption(browser.command('each')
+    .option('--target <selector>', 'List container or item selector, when the guess is wrong')
+    .option('--detail <selector>', 'Detail region selector, when the guess is wrong')
+    .option('--limit <n>', 'Stop after this many items')
+    .option('--min-interval <ms>', 'Minimum time between two items', '300')
+    .option('--time-budget <s>', 'Seconds this call may run', '100')
+    .option('--resume', 'Continue the previous run', false)
+    .option('--rediscover', 'Ignore the cached recipe', false)
+    .option('--save <file>', 'JSON-lines file for the full data')
+    .option('--json', 'Print the result object instead of the text', false)
+    .description('Open every item of the list on this page, read its detail, save it (read-only; no selectors needed)'))
+    .action(browserAction(async (page, opts) => {
+      const num = (v: unknown) => (v === undefined ? undefined : Number(v));
+      const result = await runEach(page, {
+        target: opts.target, detail: opts.detail, limit: num(opts.limit), minIntervalMs: num(opts.minInterval),
+        timeBudgetS: num(opts.timeBudget), resume: opts.resume === true, rediscover: opts.rediscover === true, save: opts.save,
+      });
+      if (opts.json) emitResult(result); else console.log(`${describeEach(result, 40)}\nNEXT ${result.next}`);
+      if (!result.ok) process.exitCode = EXIT_CODES.GENERIC_ERROR;
     }));
 
   browser.command('queue')

@@ -18,6 +18,7 @@ import type { IPage } from '../types.js';
 import { preciseClick, preciseTargets, type PreciseTargetsResult } from '../browser/precise.js';
 import { describeUpload, smartUpload, type SmartUploadResult } from '../browser/upload.js';
 import { renderScreen } from './screen.js';
+import { describeEach, runEach } from '../browser/each.js';
 import { hintFor, PLAYBOOK, readLog } from './troubleshoot.js';
 
 export const VERBS = ['open', 'look', 'click', 'type', 'key', 'upload', 'wait', 'scroll', 'read', 'images', 'save', 'shot', 'each', 'queue', 'done', 'help', 'debug'] as const;
@@ -313,7 +314,7 @@ export async function resolveLabel(page: IPage, raw: string): Promise<string | {
   const role = m ? m[1].toLowerCase() : null;
   const want = (m ? m[2] : raw).trim().toLowerCase();
   const map = await preciseTargets(page, {});
-  const pool = map.targets.filter((t) => !role || (t.role || t.tag) === role);
+  const pool = map.targets.filter((t) => !t.noise && (!role || (t.role || t.tag) === role));
   const exact = pool.filter((t) => t.name.toLowerCase() === want);
   const hits = exact.length > 0 ? exact : pool.filter((t) => t.name.toLowerCase().includes(want));
   if (hits.length === 1) return String(hits[0].ref);
@@ -350,7 +351,7 @@ export async function actSteps(page: IPage, steps: ActInput[], common: { session
 /** Run one verb against a page. Never throws; errors come back as `ERR …` text. */
 export async function act(page: IPage, input: ActInput, opts: { screen?: boolean } = {}): Promise<ActOutput> {
   // Hard ceiling: an action may fail, it may never hang the caller.
-  const budget = input.do === 'wait' ? (Math.min(input.seconds ?? 30, 300) + 15) * 1000 : input.do === 'upload' ? 120_000 : 45_000;
+  const budget = input.do === 'each' ? (Math.min(Math.max(input.time_budget ?? 100, 5), 3600) + 30) * 1000 : input.do === 'wait' ? (Math.min(input.seconds ?? 30, 300) + 15) * 1000 : input.do === 'upload' ? 120_000 : 45_000;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const deadline = new Promise<ActOutput>((resolve) => {
     timer = setTimeout(() => resolve(fail(`${input.do} failed: no answer from the browser within ${budget / 1000}s`,
@@ -482,6 +483,16 @@ async function actInner(page: IPage, input: ActInput, opts: { screen?: boolean }
         const b64 = await capture({ format: 'png', path: out });
         if (!fs.existsSync(out) && b64) fs.writeFileSync(out, Buffer.from(b64, 'base64'));
         return { ok: true, text: `OK shot ${out} (numbers on the image are the refs) ${ms()}` };
+      }
+      case 'each': {
+        // Read-only walk over a list: opens items in-page, never types or submits, needs no foreground.
+        const r = await runEach(page, {
+          target: input.target === undefined ? undefined : String(input.target), detail: input.selector,
+          limit: input.limit, minIntervalMs: input.min_interval_ms, timeBudgetS: input.time_budget,
+          resume: input.resume, save: input.save, rediscover: input.rediscover,
+        });
+        const text = `each ${describeEach(r, input.max ?? 25)}`;
+        return r.ok ? { ok: true, text: `OK ${text}\nNEXT ${r.next}` } : fail(text, r.next);
       }
       case 'help':
         return { ok: true, text: PLAYBOOK };

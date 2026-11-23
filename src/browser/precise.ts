@@ -54,6 +54,8 @@ export interface PreciseTarget {
   /** Present when another element is on top of the centre. */
   covered_by?: string;
   disabled?: boolean;
+  /** Unnamed wrapper or inner duplicate of another target; left out of the act OPTIONS. */
+  noise?: boolean;
 }
 
 export interface PreciseViewport {
@@ -202,6 +204,15 @@ export function listTargetsJs(opts: { max?: number; all?: boolean } = {}): strin
           cx, cy, in_viewport: inView,
         };
         if (el.disabled === true || el.getAttribute('aria-disabled') === 'true') item.disabled = true;
+        // Noise: a wrapper or inner copy of one control, not a separate thing to click.
+        const plain = (item.role === '' || item.role === 'none' || item.role === 'presentation') && !/^(input|button|a|select|textarea|summary|label)$/.test(item.tag) && !el.isContentEditable;
+        if (plain) {
+          const up = el.parentElement ? el.parentElement.closest('[data-opencli-ref]') : null;
+          const down = el.querySelector('[data-opencli-ref]');
+          if (!item.name) { if (up || down || item.role !== '') item.noise = true; }
+          else if (up && __role(up) !== '' && __name(up) === item.name) item.noise = true;
+          else if (down && __name(down) === item.name) item.noise = true;
+        }
         if (inView && cx >= 0 && cy >= 0 && cx < vw && cy < vh) {
           const top = document.elementFromPoint(cx, cy);
           if (top && top !== el && !el.contains(top) && !top.contains(el)) item.covered_by = __desc(top);
