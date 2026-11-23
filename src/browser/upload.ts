@@ -504,7 +504,6 @@ export async function smartUpload(page: IPage, specs: string[], opts: SmartUploa
   already = Math.max(before.blobs, before.previews);
 
   expected = files.length;
-  const hidden = await isHiddenPage(page);
   let via = '';
   /** Native route first (real paths, any size); when Chrome or the extension refuses, set File objects in the page. */
   const setBatch = async (batch: string[]): Promise<void> => {
@@ -555,6 +554,7 @@ export async function smartUpload(page: IPage, specs: string[], opts: SmartUploa
         }
 
         if (strategy === 'capture') {
+          const hidden = await isHiddenPage(page);
           await page.evaluate(ARM_JS);
           let captured = false;
           const clicked: string[] = [];
