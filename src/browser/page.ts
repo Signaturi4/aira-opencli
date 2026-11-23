@@ -303,6 +303,10 @@ export class Page extends CDPBasePage {
     const visible = async (): Promise<boolean> => {
       try { return (await this.evaluate('document.visibilityState')) === 'visible'; } catch { return false; }
     };
+    // A page that cannot even answer gets no input at all.
+    try { await this.evaluate('document.visibilityState'); } catch (err) {
+      throw new NativeInputVisibilityError(`the visibility check failed (${err instanceof Error ? err.message : String(err)})`);
+    }
     const waitVisible = async (ms: number): Promise<boolean> => {
       const end = Date.now() + ms;
       do {
@@ -459,7 +463,7 @@ export class Page extends CDPBasePage {
 
   /** Precise click using DOM.getContentQuads/getBoxModel for inline elements */
   async clickWithQuads(ref: string): Promise<void> {
-    await this.assertNativeInputVisible();
+    await this.assertNativeInputVisible('mouse');
     const safeRef = JSON.stringify(ref);
     const cssSelector = `[data-opencli-ref="${ref.replace(/"/g, '\\"')}"]`;
 

@@ -571,14 +571,26 @@ describe('Page.evaluateOnce', () => {
 
 describe('daemon-backed native input visibility', () => {
   beforeEach(() => { sendCommandMock.mockReset(); sendCommandFullMock.mockReset(); });
-  it('blocks hidden native clicks, key presses and quad clicks before CDP dispatch', async () => {
+  it('blocks hidden native clicks, key presses and quad clicks before CDP dispatch (strict guard)', async () => {
     sendCommandMock.mockResolvedValue('hidden');
     const page = new Page('hidden-session');
-    await expect(page.nativeClick(1, 2)).rejects.toMatchObject({ code: 'COMMAND_EXEC' });
-    await expect(page.pressKey('Enter')).rejects.toMatchObject({ code: 'COMMAND_EXEC' });
-    await expect(page.clickWithQuads('1')).rejects.toMatchObject({ code: 'COMMAND_EXEC' });
+    process.env.OPENCLI_INPUT_GUARD = 'strict';
+    try {
+      await expect(page.nativeClick(1, 2)).rejects.toMatchObject({ code: 'COMMAND_EXEC' });
+      await expect(page.pressKey('Enter')).rejects.toMatchObject({ code: 'COMMAND_EXEC' });
+      await expect(page.clickWithQuads('1')).rejects.toMatchObject({ code: 'COMMAND_EXEC' });
+    } finally { delete process.env.OPENCLI_INPUT_GUARD; }
     expect(sendCommandMock.mock.calls.every(([action]) => action === 'exec')).toBe(true);
     expect(sendCommandMock.mock.calls.every(([, args]) => args.code.includes('document.visibilityState'))).toBe(true);
+  });
+  it('AIRA default on a hidden page: mouse input is refused, keys go through for the caller to check', async () => {
+    sendCommandMock.mockResolvedValue('hidden');
+    const page = new Page('hidden-default');
+    await expect(page.nativeClick(1, 2)).rejects.toMatchObject({ code: 'COMMAND_EXEC' });
+    await expect(page.clickWithQuads('1')).rejects.toMatchObject({ code: 'COMMAND_EXEC' });
+    expect(sendCommandMock.mock.calls.some(([action]) => action === 'cdp')).toBe(false);
+    await expect(page.pressKey('Enter')).resolves.toBeUndefined();
+    expect(sendCommandMock.mock.calls.some(([action]) => action === 'cdp')).toBe(true);
   });
   it('does not dispatch input when the visibility probe fails', async () => {
     sendCommandMock.mockRejectedValue(new Error('Execution context unavailable'));
