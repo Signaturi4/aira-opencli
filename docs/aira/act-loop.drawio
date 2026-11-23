@@ -1,0 +1,111 @@
+<mxfile host="app.diagrams.net" agent="AIRA OpenCLI">
+  <diagram id="act-loop" name="act loop">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1400" pageHeight="900" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="title" value="AIRA OpenCLI: how an agent drives the browser through one MCP tool (act)" style="text;html=1;fontSize=20;fontStyle=1;align=left;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="900" height="40" as="geometry" />
+        </mxCell>
+
+        <mxCell id="lane1" value="Model (small and fast, e.g. Haiku)" style="swimlane;startSize=30;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;html=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="80" width="300" height="760" as="geometry" />
+        </mxCell>
+        <mxCell id="m1" value="Keeps only the task in context&lt;br&gt;(prompt, image to upload, what to get back)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;" vertex="1" parent="lane1">
+          <mxGeometry x="30" y="50" width="240" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="m2" value="Picks the next step from OPTIONS&lt;br&gt;&lt;i&gt;no page reading, no screenshots&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;" vertex="1" parent="lane1">
+          <mxGeometry x="30" y="160" width="240" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="m3" value="Calls act once&lt;br&gt;{do, target, text, files}&lt;br&gt;or a plan: {steps:[...]}" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;" vertex="1" parent="lane1">
+          <mxGeometry x="30" y="270" width="240" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="m4" value="OK?" style="rhombus;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;" vertex="1" parent="lane1">
+          <mxGeometry x="100" y="560" width="100" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="m5" value="ERR: follow the NEXT line&lt;br&gt;(do=help / do=debug if stuck)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="lane1">
+          <mxGeometry x="30" y="670" width="240" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="e_m1m2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="lane1" source="m1" target="m2"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_m2m3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="lane1" source="m2" target="m3"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_m4m5" value="no" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="lane1" source="m4" target="m5"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_m4m2" value="yes: next step" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;exitX=0;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="lane1" source="m4" target="m2">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="10" y="595" /><mxPoint x="10" y="190" /></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e_m5m2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;dashed=1;exitX=1;exitY=0.5;entryX=1;entryY=0.5;" edge="1" parent="lane1" source="m5" target="m2">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="290" y="695" /><mxPoint x="290" y="190" /></Array></mxGeometry>
+        </mxCell>
+
+        <mxCell id="lane2" value="MCP server: opencli mcp (one long-lived process, stdio)" style="swimlane;startSize=30;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;html=1;" vertex="1" parent="1">
+          <mxGeometry x="380" y="80" width="560" height="760" as="geometry" />
+        </mxCell>
+        <mxCell id="s1" value="Validate input, queue per session&lt;br&gt;hard time limit: 45 s (upload 120 s)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;" vertex="1" parent="lane2">
+          <mxGeometry x="40" y="50" width="220" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="s2" value="Resolve target&lt;br&gt;ref / label:name / CSS / x,y&lt;br&gt;to an element and its coordinates" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;" vertex="1" parent="lane2">
+          <mxGeometry x="40" y="150" width="220" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="s3" value="&lt;b&gt;click&lt;/b&gt;: precise click&lt;br&gt;pre-check cover, one trusted click,&lt;br&gt;verify landing, diff before/after" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="lane2">
+          <mxGeometry x="40" y="260" width="220" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="s4" value="&lt;b&gt;upload&lt;/b&gt;: input, capture, drop,&lt;br&gt;paste, (clipboard); verify previews&lt;br&gt;after each" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="lane2">
+          <mxGeometry x="300" y="260" width="220" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="s5" value="&lt;b&gt;open / type / key / wait / scroll /&lt;br&gt;read / images / save / shot&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="lane2">
+          <mxGeometry x="300" y="150" width="220" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="s6" value="Plan? run the next step without&lt;br&gt;going back to the model;&lt;br&gt;stop at the first ERR" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;" vertex="1" parent="lane2">
+          <mxGeometry x="300" y="50" width="220" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="s7" value="Build the answer&lt;br&gt;line 1: OK|ERR verb verdict ms&lt;br&gt;NEXT hint on error&lt;br&gt;PAGE title | url&lt;br&gt;OPTIONS: ref role &quot;name&quot; (max 40)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;align=left;spacingLeft=10;" vertex="1" parent="lane2">
+          <mxGeometry x="40" y="420" width="260" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="s8" value="Debug log, always on&lt;br&gt;~/.opencli/aira-mcp/log-DATE.jsonl&lt;br&gt;~/.opencli/precise-click/log.jsonl" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;size=12;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="lane2">
+          <mxGeometry x="330" y="420" width="200" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="s9" value="Troubleshooting table&lt;br&gt;error text to plain next step" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="lane2">
+          <mxGeometry x="40" y="600" width="260" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="e_s1s2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="lane2" source="s1" target="s2"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_s2s3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="lane2" source="s2" target="s3"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_s2s5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="lane2" source="s2" target="s5"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_s2s4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;exitX=1;exitY=0.75;entryX=0;entryY=0.25;" edge="1" parent="lane2" source="s2" target="s4"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_s3s7" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="lane2" source="s3" target="s7"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_s4s7" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;exitX=0.5;exitY=1;entryX=0.75;entryY=0;" edge="1" parent="lane2" source="s4" target="s7"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_s5s6" value="more steps" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;dashed=1;" edge="1" parent="lane2" source="s5" target="s6"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_s6s1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;dashed=1;" edge="1" parent="lane2" source="s6" target="s1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_s7s8" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="lane2" source="s7" target="s8"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_s9s7" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="lane2" source="s9" target="s7"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <mxCell id="lane3" value="Browser (logged-in Chrome profile)" style="swimlane;startSize=30;fillColor=#ffe6cc;strokeColor=#d79b00;fontStyle=1;html=1;" vertex="1" parent="1">
+          <mxGeometry x="980" y="80" width="340" height="760" as="geometry" />
+        </mxCell>
+        <mxCell id="b1" value="opencli daemon&lt;br&gt;localhost:19825" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d79b00;" vertex="1" parent="lane3">
+          <mxGeometry x="60" y="60" width="220" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="b2" value="Chrome extension bridge&lt;br&gt;(chrome.debugger / CDP)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d79b00;" vertex="1" parent="lane3">
+          <mxGeometry x="60" y="160" width="220" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="b3" value="Page tab&lt;br&gt;DOM snapshot gives each control&lt;br&gt;a ref and x,y,w,h" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d79b00;" vertex="1" parent="lane3">
+          <mxGeometry x="60" y="270" width="220" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="b4" value="Trusted input&lt;br&gt;Input.dispatchMouseEvent / KeyEvent&lt;br&gt;file chooser interception" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d79b00;" vertex="1" parent="lane3">
+          <mxGeometry x="60" y="400" width="220" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="e_b1b2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;startArrow=block;" edge="1" parent="lane3" source="b1" target="b2"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_b2b3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;startArrow=block;" edge="1" parent="lane3" source="b2" target="b3"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_b3b4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;startArrow=block;" edge="1" parent="lane3" source="b3" target="b4"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <mxCell id="x1" value="1. tools/call act" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeWidth=2;" edge="1" parent="1" source="m3" target="s1">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="360" y="385" /><mxPoint x="360" y="160" /></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="x2" value="2. commands" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;startArrow=block;strokeWidth=2;" edge="1" parent="1" source="s5" target="b1">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="960" y="265" /><mxPoint x="960" y="165" /></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="x3" value="3. answer: result + the options to click next" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeWidth=2;" edge="1" parent="1" source="s7" target="m4">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="360" y="555" /><mxPoint x="360" y="675" /></Array></mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

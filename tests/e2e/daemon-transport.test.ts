@@ -159,7 +159,7 @@ describe('daemon transport contracts (real daemon)', () => {
       if (process.env.CI === 'true') throw new Error(skipReason);
       return;
     }
-    daemon = spawn(process.execPath, [DAEMON_ENTRY], { stdio: ['ignore', 'ignore', 'pipe'] });
+    daemon = spawn(process.execPath, [DAEMON_ENTRY], { stdio: ['ignore', 'ignore', 'pipe'], env: { ...process.env, OPENCLI_HARDENING: 'off' } });
     let stderr = '';
     daemon.stderr?.on('data', (chunk) => { stderr += chunk.toString(); });
     try {

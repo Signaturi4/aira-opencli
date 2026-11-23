@@ -5,14 +5,15 @@
     "access": "public",
     "provenance": true
   },
-  "description": "Make any website your CLI. AI-powered.",
+  "description": "AIRA OpenCLI: fork of jackwener/opencli with verified precise clicks, smart file upload and a one-tool MCP server (act) for fast browser agents.",
   "engines": {
     "node": ">=20.18.1"
   },
   "type": "module",
   "main": "dist/src/main.js",
   "bin": {
-    "opencli": "dist/src/main.js"
+    "opencli": "dist/src/main.js",
+    "aira-opencli": "dist/src/main.js"
   },
   "exports": {
     ".": "./dist/src/main.js",

@@ -12,6 +12,8 @@ import { NETWORK_INTERCEPTOR_JS } from '../browser/network-interceptor.js';
 import { assignKeys } from '../browser/network-key.js';
 import { sanitizeCapturedRequest, sanitizeCapturedUrl, type SafeNetworkRequest } from '../browser/network-request.js';
 import { profileRouteParams, resolveProfileSelection, type ProfileSelection } from '../browser/profile.js';
+import { preciseAt, preciseClick, preciseTargets, readPreciseLog } from '../browser/precise.js';
+import { smartUpload, type UploadStrategy } from '../browser/upload.js';
 import { parseFilter, shapeMatchesFilter } from '../browser/shape-filter.js';
 import { inferShape } from '../browser/shape.js';
 import { TargetError, type TargetErrorCode } from '../browser/target-errors.js';
@@ -258,7 +260,7 @@ async function resolveStoredBrowserTarget(page: import('../types.js').IPage, sco
 }
 
 /** Create a browser page for browser commands. Uses a named browser session for continuity. */
-async function getBrowserPage(
+export async function getBrowserPage(
   session: string,
   targetPage?: string,
   profileSelection?: ProfileSelection,
@@ -652,12 +654,32 @@ export function registerBrowserCommands(program: Command): Command {
 
   // ── Navigation ──
 
-  addBrowserTabOption(browser.command('open').argument('<url>').description('Open URL in the browser session'))
-    .action(browserAction(async (page, url) => {
+  addBrowserTabOption(browser.command('open').argument('<url>')
+    .option('--timeout <seconds>', 'Stop waiting for the page to go idle after this many seconds and continue', '15')
+    .description('Open URL in the browser session'))
+    .action(browserAction(async (page, url, opts) => {
       // Start session-level capture before navigation (catches initial requests)
       const hasSessionCapture = await page.startNetworkCapture?.() ?? false;
-      await page.goto(url);
-      await page.wait(2);
+      // Streaming apps (Gemini, Flow) never go idle: wait a bounded time, say so, and continue.
+      const limitMs = parsePositiveIntOption(opts.timeout, '--timeout', 15) * 1000;
+      const started = Date.now();
+      const progress = setInterval(() => {
+        process.stderr.write(`opening ${url} ... ${Math.round((Date.now() - started) / 1000)}s\n`);
+      }, 5000);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const nav = page.goto(url).then(() => 'done' as const);
+        nav.catch(() => undefined);
+        const first = await Promise.race([
+          nav,
+          new Promise<'slow'>((resolve) => { timer = setTimeout(() => resolve('slow'), limitMs); }),
+        ]);
+        if (first === 'slow') process.stderr.write(`page did not reach idle within ${limitMs / 1000}s, continuing\n`);
+        else await page.wait(2);
+      } finally {
+        clearInterval(progress);
+        if (timer) clearTimeout(timer);
+      }
       // Fallback: inject JS interceptor when session capture is unavailable
       if (!hasSessionCapture) {
         try { await page.evaluate(NETWORK_INTERCEPTOR_JS); } catch { /* non-fatal */ }
@@ -1380,6 +1402,100 @@ export function registerBrowserCommands(program: Command): Command {
         ...(retargeted && { retargeted }),
       });
     }));
+
+  // ── Precise click (AIRA) ──────────────────────────────────────────────────
+
+  addBrowserTabOption(browser.command('targets')
+    .option('--max <n>', 'Maximum number of targets to return', '150')
+    .option('--all', 'Include targets outside the viewport', false)
+    .description('Where to click: every clickable element with ref, role, name, box, centre (CSS px) and what covers it'))
+    .action(browserAction(async (page, opts) => {
+      emitResult(await preciseTargets(page, {
+        max: parsePositiveIntOption(opts.max, '--max', 150),
+        all: opts.all === true,
+      }));
+    }));
+
+  addBrowserTabOption(browser.command('at')
+    .argument('<x>', 'Viewport x in CSS px (screenshot px / devicePixelRatio)')
+    .argument('<y>', 'Viewport y in CSS px')
+    .description('What is at a point: element, clickable owner, ref, box and centre'))
+    .action(browserAction(async (page, x, y) => {
+      const px = Number(x), py = Number(y);
+      if (!Number.isFinite(px) || !Number.isFinite(py)) {
+        emitFailure({ code: 'usage_error', message: 'x and y must be numbers (CSS px)' }, EXIT_CODES.USAGE_ERROR);
+        return;
+      }
+      emitResult(await preciseAt(page, px, py));
+    }));
+
+  addBrowserTabOption(
+    addSemanticLocatorOptions(browser.command('pclick'))
+      .argument('[target]', 'Numeric ref (from targets / state), CSS selector, or "x,y" in CSS px')
+      .option('--nth <n>', 'When <target> is a multi-match CSS selector, pick the nth match (0-based)')
+      .option('--expect <js>', 'JS expression that must be truthy after the click (PASS / EXPECT_FAILED)')
+      .option('--force', 'Click even when the target is covered or the point is not clickable', false)
+      .option('--settle <ms>', 'Milliseconds to wait before reading the page again', '350')
+      .option('--note <text>', 'Free text stored with the log line')
+      .description('Verified click: pre-check, one trusted click, real landing point, before/after diff, verdict'),
+  )
+    .action(browserAction(async (page, target, opts) => {
+      let clickTarget: string;
+      if (typeof target === 'string' && /^\s*-?\d+(\.\d+)?\s*,\s*-?\d+(\.\d+)?\s*$/.test(target)) {
+        clickTarget = target;
+      } else {
+        const resolvedTarget = await resolveExplicitOrSemanticTarget(page, target, opts ?? {}, 'write');
+        if (typeof resolvedTarget !== 'string' && 'error' in resolvedTarget) {
+          emitFailure(resolvedTarget.error, EXIT_CODES.USAGE_ERROR);
+          return;
+        }
+        clickTarget = typeof resolvedTarget === 'string' ? resolvedTarget : resolvedTarget.target;
+      }
+      const parsed = nthToResolveOpts(opts?.nth);
+      if ('error' in parsed) {
+        emitFailure({ code: 'usage_error', message: parsed.error }, EXIT_CODES.USAGE_ERROR);
+        return;
+      }
+      const result = await preciseClick(page, clickTarget, {
+        ...parsed.opts,
+        expect: typeof opts?.expect === 'string' ? opts.expect : undefined,
+        force: opts?.force === true,
+        note: typeof opts?.note === 'string' ? opts.note : undefined,
+        settleMs: parsePositiveIntOption(opts?.settle, '--settle', 350),
+        session: getPageSession(page),
+      });
+      emitResult(result);
+      if (!result.clicked || result.verdict === 'MISSED' || result.verdict === 'EXPECT_FAILED') {
+        process.exitCode = EXIT_CODES.GENERIC_ERROR;
+      }
+    }));
+
+  addBrowserTabOption(browser.command('attach')
+    .argument('<files...>', 'Local paths, http(s) URLs or data: URIs')
+    .option('--target <target>', 'Ref / CSS selector of the file input, the upload button or the drop zone')
+    .option('--clipboard', 'Allow a real clipboard paste as last resort (replaces the system clipboard)', false)
+    .option('--convert <format>', 'Convert images first: png or jpeg')
+    .option('--max-px <n>', 'Downscale images to this longest side')
+    .option('--only <list>', 'Comma-separated strategies to run: input,capture,drop,paste,clipboard')
+    .description('Attach files the way that works on this page (input, capture, drop, paste) and report which one did'))
+    .action(browserAction(async (page, files, opts) => {
+      const result = await smartUpload(page, files as string[], {
+        target: typeof opts.target === 'string' ? opts.target : undefined,
+        clipboard: opts.clipboard === true,
+        convert: opts.convert === 'png' || opts.convert === 'jpeg' ? opts.convert : undefined,
+        maxPx: opts.maxPx ? parsePositiveIntOption(opts.maxPx, '--max-px', 2048) : undefined,
+        only: typeof opts.only === 'string' ? opts.only.split(',').map((s: string) => s.trim()).filter(Boolean) as UploadStrategy[] : undefined,
+      });
+      emitResult(result);
+      if (result.verdict !== 'PASS') process.exitCode = EXIT_CODES.GENERIC_ERROR;
+    }));
+
+  browser.command('pclick-log')
+    .argument('[n]', 'Number of entries', '20')
+    .description('Last precise-click actions: verdict, target, landing, what changed')
+    .action((n: string) => {
+      emitResult({ entries: readPreciseLog(Number(n) || 20) });
+    });
 
   addBrowserTabOption(
     addSemanticLocatorOptions(browser.command('type'))

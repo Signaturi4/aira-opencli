@@ -1,0 +1,376 @@
+/**
+ * The `act` verbs behind the MCP server.
+ *
+ * Contract for every verb: do ONE thing, never block longer than the budget,
+ * and answer with a result line followed by the screen (what can be clicked
+ * next). The caller never needs a second call just to read the page.
+ *
+ *   OK click 9 -> PASS (changed: dialog/menu) 412ms
+ *   PAGE … | …
+ *   OPTIONS n
+ *   <ref> <role> "<name>"
+ */
+
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import type { IPage } from '../types.js';
+import { preciseClick, preciseTargets, type PreciseTargetsResult } from '../browser/precise.js';
+import { describeUpload, smartUpload } from '../browser/upload.js';
+import { renderScreen } from './screen.js';
+import { hintFor, PLAYBOOK, readLog } from './troubleshoot.js';
+
+export const VERBS = ['open', 'look', 'click', 'type', 'key', 'upload', 'wait', 'scroll', 'read', 'images', 'save', 'shot', 'help', 'debug'] as const;
+export type Verb = typeof VERBS[number];
+
+export interface ActInput {
+  do: Verb;
+  session?: string;
+  /** click/type/upload/read/save: ref number, CSS selector, or "x,y". */
+  target?: string | number;
+  url?: string;
+  text?: string;
+  /** type: press Enter after typing. */
+  submit?: boolean;
+  key?: string;
+  files?: string[];
+  /** wait: text that must appear / disappear, or a CSS selector that must match. */
+  until?: string;
+  gone?: string;
+  selector?: string;
+  /** wait: maximum seconds (default 30, cap 300). */
+  seconds?: number;
+  direction?: 'up' | 'down';
+  /** look: filter options by text. */
+  find?: string;
+  /** save/shot: output file path. */
+  path?: string;
+  /** upload: allow a real clipboard paste (replaces the system clipboard). */
+  clipboard?: boolean;
+  /** upload: convert images first. */
+  convert?: 'png' | 'jpeg';
+  /** upload: downscale images to this longest side in px. */
+  max_px?: number;
+  /** click: JS that must be truthy afterwards. */
+  expect?: string;
+  force?: boolean;
+  /** Maximum option lines in the answer (default 40). */
+  max?: number;
+}
+
+export interface ActPlan {
+  steps: ActInput[];
+  session?: string;
+  max?: number;
+}
+
+export interface ActOutput {
+  ok: boolean;
+  text: string;
+}
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+function fail(message: string, next?: string): ActOutput {
+  return { ok: false, text: `ERR ${message}\nNEXT ${next ?? hintFor(message)}` };
+}
+
+/** Validate raw tool arguments. Returns an error string or the typed input. */
+export function parseActInput(raw: unknown): ActInput | ActPlan | string {
+  if (!raw || typeof raw !== 'object') return 'arguments must be an object';
+  const a = raw as Record<string, unknown>;
+  if (a.steps !== undefined) {
+    if (!Array.isArray(a.steps) || a.steps.length === 0 || a.steps.length > 20) return 'steps must be an array of 1 to 20 actions';
+    if (a.session !== undefined && typeof a.session !== 'string') return 'session must be a string';
+    const steps: ActInput[] = [];
+    for (let i = 0; i < a.steps.length; i++) {
+      const one = parseActInput(a.steps[i]);
+      if (typeof one === 'string') return `steps[${i}]: ${one}`;
+      if ('steps' in one) return `steps[${i}]: steps cannot be nested`;
+      steps.push(one);
+    }
+    return { steps, session: a.session as string | undefined, max: typeof a.max === 'number' ? a.max : undefined };
+  }
+  if (typeof a.do !== 'string' || !(VERBS as readonly string[]).includes(a.do)) return `do must be one of: ${VERBS.join(', ')}`;
+  const str = (k: string) => (a[k] === undefined || typeof a[k] === 'string' ? null : `${k} must be a string`);
+  for (const k of ['session', 'url', 'text', 'key', 'until', 'gone', 'selector', 'find', 'path', 'expect']) {
+    const e = str(k);
+    if (e) return e;
+  }
+  if (a.target !== undefined && typeof a.target !== 'string' && typeof a.target !== 'number') return 'target must be a ref number, a CSS selector or "x,y"';
+  if (a.files !== undefined && !(Array.isArray(a.files) && a.files.every((f) => typeof f === 'string'))) return 'files must be an array of file paths';
+  if (a.seconds !== undefined && !(typeof a.seconds === 'number' && a.seconds >= 0)) return 'seconds must be a number >= 0';
+  if (a.max !== undefined && !(typeof a.max === 'number' && a.max >= 1)) return 'max must be a number >= 1';
+  if (a.direction !== undefined && a.direction !== 'up' && a.direction !== 'down') return 'direction must be up or down';
+  if (a.convert !== undefined && a.convert !== 'png' && a.convert !== 'jpeg') return 'convert must be png or jpeg';
+  if (a.max_px !== undefined && !(typeof a.max_px === 'number' && a.max_px >= 16)) return 'max_px must be a number >= 16';
+  const need = (k: string) => (a[k] === undefined || a[k] === '' ? `do=${String(a.do)} needs ${k}` : null);
+  const required: Record<string, string[]> = {
+    open: ['url'], click: ['target'], type: ['target', 'text'], key: ['key'], upload: ['files'], save: ['target'],
+  };
+  for (const k of required[a.do] ?? []) {
+    const e = need(k);
+    if (e) return e;
+  }
+  if (a.do === 'wait' && a.until === undefined && a.gone === undefined && a.selector === undefined && a.seconds === undefined) {
+    return 'do=wait needs one of: until, gone, selector, seconds';
+  }
+  return a as unknown as ActInput;
+}
+
+async function screen(page: IPage, input: ActInput): Promise<string> {
+  const map = await preciseTargets(page, {});
+  return renderScreen(map, { max: input.max, find: input.do === 'look' ? input.find : undefined });
+}
+
+/** Poll until the page has clickable elements and the count stopped changing, or the budget ends. */
+async function settle(page: IPage, budgetMs: number): Promise<{ map: PreciseTargetsResult | null; loading: boolean }> {
+  const end = Date.now() + budgetMs;
+  let last = -1;
+  let map: PreciseTargetsResult | null = null;
+  while (Date.now() < end) {
+    try {
+      map = await preciseTargets(page, {});
+      if (map.count > 0 && map.count === last) return { map, loading: false };
+      last = map.count;
+    } catch {
+      // The document is still being replaced; try again within the budget.
+    }
+    await sleep(250);
+  }
+  return { map, loading: true };
+}
+
+const IMAGES_JS = `
+  (() => Array.from(document.images)
+    .map((img, i) => ({ i, src: img.currentSrc || img.src, w: img.naturalWidth, h: img.naturalHeight, alt: (img.alt || '').slice(0, 60), r: img.getBoundingClientRect() }))
+    .filter((x) => x.w >= 256 && x.h >= 256 && x.src)
+    .map((x) => ({ i: x.i, src: x.src, w: x.w, h: x.h, alt: x.alt, visible: x.r.bottom > 0 && x.r.top < window.innerHeight })))()
+`;
+
+function fetchImageJs(index: number): string {
+  return `
+    (async () => {
+      const img = document.images[${index}];
+      if (!img) return { error: 'no image with that index' };
+      const src = img.currentSrc || img.src;
+      try {
+        const res = await fetch(src, { credentials: 'include' });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const blob = await res.blob();
+        const data = await new Promise((resolve, reject) => { const fr = new FileReader(); fr.onload = () => resolve(fr.result); fr.onerror = () => reject(fr.error); fr.readAsDataURL(blob); });
+        return { data, type: blob.type, src };
+      } catch (e) {
+        try {
+          const c = document.createElement('canvas'); c.width = img.naturalWidth; c.height = img.naturalHeight;
+          c.getContext('2d').drawImage(img, 0, 0);
+          return { data: c.toDataURL('image/png'), type: 'image/png', src };
+        } catch (e2) { return { error: String(e && e.message || e), src }; }
+      }
+    })()
+  `;
+}
+
+function waitConditionJs(input: ActInput): string {
+  return `
+    (() => {
+      const text = (document.body && document.body.innerText) || '';
+      const until = ${JSON.stringify(input.until ?? null)}, gone = ${JSON.stringify(input.gone ?? null)}, selector = ${JSON.stringify(input.selector ?? null)};
+      if (until !== null && !text.includes(until)) return false;
+      if (gone !== null && text.includes(gone)) return false;
+      if (selector !== null) { try { if (!document.querySelector(selector)) return false; } catch (e) { return false; } }
+      return true;
+    })()
+  `;
+}
+
+function readJs(target: string | undefined, limit: number): string {
+  return `
+    (() => {
+      const t = ${JSON.stringify(target ?? null)};
+      let el = document.body;
+      if (t !== null) {
+        el = /^\\d+$/.test(t) ? document.querySelector('[data-opencli-ref="' + t + '"]') : document.querySelector(t);
+        if (!el) return null;
+      }
+      const text = (el.innerText || el.textContent || '').replace(/[ \\t]+/g, ' ').replace(/\\n{3,}/g, '\\n\\n').trim();
+      return text.length > ${limit} ? '…' + text.slice(-${limit}) : text;
+    })()
+  `;
+}
+
+/**
+ * Resolve `label:<text>` to a ref at execution time, so a multi-step plan does
+ * not depend on ref numbers that only exist after an earlier step.
+ * `label:button:Send` narrows by role. Exact name wins over "contains".
+ */
+export async function resolveLabel(page: IPage, raw: string): Promise<string | { error: string; next: string }> {
+  const m = /^([a-z]+):(.+)$/i.exec(raw.trim());
+  const role = m ? m[1].toLowerCase() : null;
+  const want = (m ? m[2] : raw).trim().toLowerCase();
+  const map = await preciseTargets(page, {});
+  const pool = map.targets.filter((t) => !role || (t.role || t.tag) === role);
+  const exact = pool.filter((t) => t.name.toLowerCase() === want);
+  const hits = exact.length > 0 ? exact : pool.filter((t) => t.name.toLowerCase().includes(want));
+  if (hits.length === 1) return String(hits[0].ref);
+  if (hits.length === 0) return { error: `no option labelled "${raw}"`, next: 'Call do=look and use a ref or an exact label from OPTIONS.' };
+  return {
+    error: `${hits.length} options match "${raw}": ${hits.slice(0, 6).map((t) => `${t.ref} ${t.role || t.tag} "${t.name}"`).join(' | ')}`,
+    next: 'Use the ref number, or label:<role>:<exact name>.',
+  };
+}
+
+/**
+ * Run a plan: steps execute in order without re-reading the page between
+ * them, stop at the first ERR, and the screen is rendered once at the end.
+ */
+export async function actSteps(page: IPage, steps: ActInput[], common: { session?: string; max?: number } = {}): Promise<ActOutput> {
+  const lines: string[] = [];
+  let ok = true;
+  for (let i = 0; i < steps.length; i++) {
+    const out = await act(page, { ...steps[i], session: common.session }, { screen: false });
+    lines.push(`${i + 1}/${steps.length} ${out.text}`);
+    if (!out.ok) { ok = false; lines.push(`STOPPED at step ${i + 1}; steps ${i + 2}..${steps.length} were not run.`); break; }
+  }
+  const map = await preciseTargets(page, {}).catch(() => null);
+  if (map) lines.push(renderScreen(map, { max: common.max }));
+  return { ok, text: lines.join('\n') };
+}
+
+/** Run one verb against a page. Never throws; errors come back as `ERR …` text. */
+export async function act(page: IPage, input: ActInput, opts: { screen?: boolean } = {}): Promise<ActOutput> {
+  // Hard ceiling: an action may fail, it may never hang the caller.
+  const budget = input.do === 'wait' ? (Math.min(input.seconds ?? 30, 300) + 15) * 1000 : input.do === 'upload' ? 120_000 : 45_000;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<ActOutput>((resolve) => {
+    timer = setTimeout(() => resolve(fail(`${input.do} failed: no answer from the browser within ${budget / 1000}s`,
+      'The page or the bridge is stuck. Call do=look; if that also times out, do=open the url again.')), budget);
+  });
+  try {
+    return await Promise.race([actInner(page, input, opts), deadline]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function actInner(page: IPage, input: ActInput, opts: { screen?: boolean } = {}): Promise<ActOutput> {
+  const started = Date.now();
+  const ms = () => `${Date.now() - started}ms`;
+  const tail = async () => (opts.screen === false ? '' : `\n${await screen(page, input)}`);
+  let target = input.target === undefined ? undefined : String(input.target);
+  try {
+    if (target !== undefined && /^label:/i.test(target) && input.do !== 'save') {
+      const found = await resolveLabel(page, target.slice(6));
+      if (typeof found !== 'string') return fail(found.error, found.next);
+      target = found;
+    }
+    switch (input.do) {
+      case 'open': {
+        // Streaming single-page apps never reach "idle": cap the navigation wait and go on.
+        const nav = page.goto(input.url as string, { waitUntil: 'none' }).then(() => 'done' as const, (e: unknown) => e);
+        const first = await Promise.race([nav, sleep(12_000).then(() => 'slow' as const)]);
+        if (first !== 'done' && first !== 'slow') throw first;
+        const { map, loading: unsettled } = await settle(page, 5000);
+        const loading = unsettled || first === 'slow';
+        const body = map ? renderScreen(map, { max: input.max }) : 'PAGE (not ready)';
+        return { ok: true, text: `OK open${loading ? ' (STILL LOADING: call look or wait)' : ''} ${ms()}\n${body}` };
+      }
+      case 'look':
+        return { ok: true, text: `OK look ${ms()}${await tail()}` };
+      case 'click': {
+        const r = await preciseClick(page, target as string, { expect: input.expect, force: input.force, session: input.session });
+        const good = r.verdict === 'PASS' || r.verdict === 'NO_CHANGE';
+        const detail = [
+          r.changed?.length ? `changed: ${r.changed.join(', ')}` : '',
+          r.covered_by ? `covered by ${r.covered_by}` : '',
+          r.verdict === 'MISSED' && r.landed_on ? `landed on ${r.landed_on}` : '',
+          r.message ?? '',
+        ].filter(Boolean).join('; ');
+        const head = `${good ? 'OK' : 'ERR'} click ${target} -> ${r.verdict}${detail ? ` (${detail})` : ''} ${ms()}`;
+        return { ok: good, text: `${head}${r.verdict === 'PASS' ? '' : `\nNEXT ${hintFor(`${r.verdict} ${detail}`, r.next)}`}${await tail()}` };
+      }
+      case 'type': {
+        const pre = await preciseClick(page, target as string, { session: input.session, settleMs: 150 });
+        if (!pre.clicked) return { ok: false, text: `ERR type ${target} -> ${pre.verdict}\nNEXT ${hintFor(`${pre.verdict} ${pre.covered_by ? 'covered by' : ''}`, pre.next)}${await tail()}` };
+        await page.typeText(target as string, input.text as string);
+        if (input.submit) await page.pressKey('Enter');
+        await sleep(input.submit ? 400 : 100);
+        return { ok: true, text: `OK type ${target} (${(input.text as string).length} chars${input.submit ? ', Enter' : ''}) ${ms()}${await tail()}` };
+      }
+      case 'key': {
+        await page.pressKey(input.key as string);
+        await sleep(250);
+        return { ok: true, text: `OK key ${input.key} ${ms()}${await tail()}` };
+      }
+      case 'upload': {
+        const r = await smartUpload(page, input.files as string[], {
+          target, clipboard: input.clipboard, convert: input.convert, maxPx: input.max_px,
+        });
+        const ok = r.verdict === 'PASS';
+        return { ok, text: `${ok ? 'OK' : 'ERR'} upload ${describeUpload(r)} ${ms()}${ok ? '' : `\nNEXT ${r.next}`}${await tail()}` };
+      }
+      case 'wait': {
+        const limit = Math.min(Math.max(input.seconds ?? 30, 0), 300) * 1000;
+        const conditional = input.until !== undefined || input.gone !== undefined || input.selector !== undefined;
+        if (!conditional) {
+          await sleep(limit);
+          return { ok: true, text: `OK wait ${ms()}${await tail()}` };
+        }
+        const end = Date.now() + limit;
+        let met = false;
+        while (Date.now() < end) {
+          try { met = (await page.evaluate(waitConditionJs(input))) === true; } catch { met = false; }
+          if (met) break;
+          await sleep(400);
+        }
+        const head = met ? `OK wait met ${ms()}` : `ERR wait timed out after ${ms()}\nNEXT The condition is still false. Call wait again, or look to see the page.`;
+        return { ok: met, text: `${head}${await tail()}` };
+      }
+      case 'scroll': {
+        await page.scroll(input.direction ?? 'down', 600);
+        await sleep(200);
+        return { ok: true, text: `OK scroll ${input.direction ?? 'down'} ${ms()}${await tail()}` };
+      }
+      case 'read': {
+        const text = await page.evaluate(readJs(target, Math.min(Math.max(input.max ?? 1500, 100), 8000))) as string | null;
+        if (text === null) return fail(`read target not found: ${target}`, 'Call look for fresh refs.');
+        return { ok: true, text: `OK read ${ms()}\n${text}` };
+      }
+      case 'images': {
+        const list = await page.evaluate(IMAGES_JS) as Array<{ i: number; src: string; w: number; h: number; alt: string; visible: boolean }>;
+        const lines = list.slice(-(input.max ?? 12)).map((x) => `${x.i} ${x.w}x${x.h}${x.visible ? '' : ' OFFSCREEN'} "${x.alt}" ${x.src.slice(0, 90)}`);
+        return { ok: true, text: `OK images ${list.length} (newest last; save with do=save target=<index>) ${ms()}\n${lines.join('\n') || '(no images of 256px or more)'}` };
+      }
+      case 'save': {
+        const index = Number(target);
+        if (!Number.isInteger(index) || index < 0) return fail('save target must be an image index from do=images', 'Call do=images first.');
+        const got = await page.evaluate(fetchImageJs(index)) as { data?: string; type?: string; src?: string; error?: string };
+        if (!got.data) return fail(`could not read image: ${got.error ?? 'unknown'}`, `Open the image url directly: ${got.src ?? ''}`);
+        const m = /^data:([^;]+);base64,(.*)$/s.exec(got.data);
+        if (!m) return fail('image came back in an unknown encoding', 'Use do=shot instead.');
+        const ext = m[1].includes('jpeg') ? 'jpg' : m[1].includes('webp') ? 'webp' : 'png';
+        const out = path.resolve((input.path ?? path.join(os.tmpdir(), `aira-image-${Date.now()}.${ext}`)).replace(/^~(?=\/)/, os.homedir()));
+        fs.mkdirSync(path.dirname(out), { recursive: true });
+        fs.writeFileSync(out, Buffer.from(m[2], 'base64'));
+        return { ok: true, text: `OK save ${out} (${fs.statSync(out).size} bytes) ${ms()}` };
+      }
+      case 'shot': {
+        const out = path.resolve((input.path ?? path.join(os.tmpdir(), `aira-shot-${Date.now()}.png`)).replace(/^~(?=\/)/, os.homedir()));
+        fs.mkdirSync(path.dirname(out), { recursive: true });
+        const capture = (page.annotatedScreenshot ?? page.screenshot).bind(page);
+        const b64 = await capture({ format: 'png', path: out });
+        if (!fs.existsSync(out) && b64) fs.writeFileSync(out, Buffer.from(b64, 'base64'));
+        return { ok: true, text: `OK shot ${out} (numbers on the image are the refs) ${ms()}` };
+      }
+      case 'help':
+        return { ok: true, text: PLAYBOOK };
+      case 'debug':
+        return { ok: true, text: readLog(input.max ?? 10) };
+      default:
+        return fail(`unknown verb ${String(input.do)}`, `Use one of: ${VERBS.join(', ')}`);
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return fail(`${input.do} failed: ${message.slice(0, 300)} ${ms()}`);
+  }
+}
