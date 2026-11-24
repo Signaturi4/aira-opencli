@@ -1,8 +1,16 @@
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { DAEMON_HOST, DEFAULT_DAEMON_PORT, isIgnorableDaemonPortEnv, unsupportedDaemonPortEnvMessage } from '../constants.js';
 
 const DAEMON_PORT = DEFAULT_DAEMON_PORT;
 const DAEMON_URL = `http://${DAEMON_HOST}:${DAEMON_PORT}`;
 const OPENCLI_HEADERS = { 'X-OpenCLI': '1' };
+
+/** Per-start daemon token (AIRA hardening); read on every request because the daemon rewrites it on start. */
+function daemonToken(): string {
+  try { return readFileSync(join(homedir(), '.opencli', 'daemon.token'), 'utf-8').trim(); } catch { return ''; }
+}
 
 class UnsupportedDaemonPortEnvError extends Error {
   constructor(value: string) {
@@ -58,7 +66,7 @@ export async function requestDaemon(pathname: string, init?: RequestInit & { tim
   try {
     return await fetch(`${DAEMON_URL}${pathname}`, {
       ...rest,
-      headers: { ...OPENCLI_HEADERS, ...headers },
+      headers: { ...OPENCLI_HEADERS, 'X-OpenCLI-Token': daemonToken(), ...headers },
       signal: controller.signal,
     });
   } finally {

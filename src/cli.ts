@@ -141,6 +141,29 @@ export function createProgram(BUILTIN_CLIS: string, USER_CLIS: string): Command 
       emitResult(report);
     });
 
+  // ── AIRA: MCP server (fast act loop over the browser bridge) ───────────────
+
+  program
+    .command('mcp')
+    .description('Serve the AIRA browser MCP tool `act` on stdio (one persistent, low-latency process)')
+    .option('--window <mode>', 'Browser window mode: foreground or background', 'background')
+    .action(async (opts, command) => {
+      const { serveMcpStdio } = await import('./mcp/server.js');
+      const { getBrowserPage } = await import('./commands/browser.js');
+      const { resolveProfileSelection, profileRouteParams } = await import('./browser/profile.js');
+      const globals = command.optsWithGlobals() as { profile?: string };
+      const profileSelection = resolveProfileSelection(typeof globals.profile === 'string' ? globals.profile : undefined);
+      const windowMode = opts.window === 'foreground' ? 'foreground' : 'background';
+      // Input reaches a hidden page too, so the window is raised only when asked for by name.
+      if (windowMode === 'foreground') process.env.OPENCLI_RAISE_WINDOW = '1';
+      await serveMcpStdio({
+        version: PKG_VERSION,
+        getPage: (session) => getBrowserPage(session, undefined, profileSelection, { windowMode }),
+        route: profileRouteParams(profileSelection),
+        log: (line) => { if (process.env.OPENCLI_MCP_LOG) process.stderr.write(`[aira-mcp] ${line}\n`); },
+      });
+    });
+
   program
     .command('completion')
     .description('Output shell completion script')

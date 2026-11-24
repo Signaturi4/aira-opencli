@@ -20,7 +20,11 @@
  *   - Listens on 127.0.0.1:19825 (plus [::1]:19825 for legacy `localhost` clients)
  */
 
+import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { createServer as createNetServer } from 'node:net';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
 import { DAEMON_HOST, DEFAULT_DAEMON_PORT, isIgnorableDaemonPortEnv, unsupportedDaemonPortEnvMessage } from './constants.js';
@@ -44,9 +48,59 @@ import {
   getSessionLeaseKey,
   isSessionLeaseCommand,
 } from './session-lease.js';
+import { ForegroundQueue } from './foreground-queue.js';
 import { SLOT_WAIT_DEFAULT_MS, SiteSlotScheduler, SlotAdmission, parseSlotPolicy, validSlotWaitMs } from './site-slots.js';
 
 const PORT = DEFAULT_DAEMON_PORT;
+
+// ─── AIRA hardening (same rules as opencli-hardening v1 on the owner's install) ──
+// 1. Host header must be a loopback literal (blocks DNS rebinding).
+// 2. Extension origins must be on an allowlist: the Web Store id, ids in
+//    OPENCLI_EXTENSION_IDS, and ids in ~/.opencli/allowed-extensions.
+// 3. Every command request carries the per-start token from ~/.opencli/daemon.token
+//    (mode 600), so only processes of this user can drive the browser.
+// OPENCLI_HARDENING=off turns all three off (tests only).
+const HARDENED = process.env.OPENCLI_HARDENING !== 'off';
+const HARDEN_DIR = join(homedir(), '.opencli');
+const TOKEN_FILE = join(HARDEN_DIR, 'daemon.token');
+const ALLOW_FILE = join(HARDEN_DIR, 'allowed-extensions');
+const WEBSTORE_EXTENSION_ID = 'ildkmabpimmkaediidaifkhjpohdnifk';
+const DAEMON_TOKEN = randomBytes(32).toString('hex');
+if (HARDENED) {
+  mkdirSync(HARDEN_DIR, { recursive: true, mode: 0o700 });
+  writeFileSync(TOKEN_FILE, DAEMON_TOKEN, { mode: 0o600 });
+  chmodSync(TOKEN_FILE, 0o600);
+}
+
+function allowedExtensionIds(): Set<string> {
+  const ids = new Set([WEBSTORE_EXTENSION_ID]);
+  for (const s of (process.env.OPENCLI_EXTENSION_IDS || '').split(/[\s,]+/)) if (s) ids.add(s.trim());
+  try {
+    for (const s of readFileSync(ALLOW_FILE, 'utf-8').split(/\s+/)) if (s && !s.startsWith('#')) ids.add(s.trim());
+  } catch { /* no allowlist file */ }
+  return ids;
+}
+
+function originAllowed(origin: string | undefined): boolean {
+  if (!HARDENED) return !!origin && origin.startsWith('chrome-extension://');
+  const m = /^chrome-extension:\/\/([a-p]{32})\/?$/.exec(origin || '');
+  if (m && allowedExtensionIds().has(m[1])) return true;
+  if (origin) log.warn(`[daemon] rejected origin ${origin}. If this is your OpenCLI extension, add its id to ${ALLOW_FILE}`);
+  return false;
+}
+
+function hostOk(req: IncomingMessage): boolean {
+  if (!HARDENED) return true;
+  const h = String(req.headers['host'] || '');
+  return h === `127.0.0.1:${PORT}` || h === `localhost:${PORT}` || h === `[::1]:${PORT}`;
+}
+
+function tokenOk(req: IncomingMessage): boolean {
+  if (!HARDENED) return true;
+  const t = Buffer.from(String(req.headers['x-opencli-token'] || ''));
+  const k = Buffer.from(DAEMON_TOKEN);
+  return t.length === k.length && timingSafeEqual(t, k);
+}
 if (!isIgnorableDaemonPortEnv(process.env.OPENCLI_DAEMON_PORT)) {
   log.error(unsupportedDaemonPortEnvMessage(process.env.OPENCLI_DAEMON_PORT));
   process.exit(EXIT_CODES.USAGE_ERROR);
@@ -97,6 +151,9 @@ const sessionLeases = new SessionLeaseRegistry();
 
 // Per-(contextId, site) slot pools with a cancellable admission queue
 // (site-slots.ts). A queued slot-acquire is an open HTTP request.
+// AIRA: one FIFO lane per profile for anything that needs the visible tab.
+const foregroundQueue = new ForegroundQueue();
+
 const slotAdmission = new SlotAdmission({
   scheduler: new SiteSlotScheduler({ ttlMs: SESSION_LEASE_TTL_MS }),
   routeFailure: (contextId) => {
@@ -267,7 +324,11 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   // legitimate CLI requests pass through.  Chrome Extension connects via
   // WebSocket (which bypasses this HTTP handler entirely).
   const origin = req.headers['origin'] as string | undefined;
-  if (origin && !origin.startsWith('chrome-extension://')) {
+  if (!hostOk(req)) {
+    jsonResponse(res, 403, { ok: false, error: 'Forbidden: bad Host header' });
+    return;
+  }
+  if (origin && !originAllowed(origin)) {
     jsonResponse(res, 403, { ok: false, error: 'Forbidden: cross-origin request blocked' });
     return;
   }
@@ -300,8 +361,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   // custom headers in "simple" requests, and our preflight returns no
   // Access-Control-Allow-Headers, so scripted fetch() from web pages is
   // blocked even if Origin check is somehow bypassed.
-  if (!req.headers['x-opencli']) {
-    jsonResponse(res, 403, { ok: false, error: 'Forbidden: missing X-OpenCLI header' });
+  if (!req.headers['x-opencli'] || !tokenOk(req)) {
+    jsonResponse(res, 403, { ok: false, error: 'Forbidden: missing X-OpenCLI header or token' });
     return;
   }
 
@@ -335,6 +396,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       pending: pending.size,
       sessionLeases: sessionLeases.list(Date.now(), runHasPendingWork),
       siteSlots: slotAdmission.list(),
+      foreground: foregroundQueue.status(),
       commandResultUnknown: commandResultUnknownCount,
       memoryMB: Math.round(mem.rss / 1024 / 1024 * 10) / 10,
       port: PORT,
@@ -425,6 +487,42 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         res.on('close', () => { if (!replied) cancel(); });
         return;
       }
+
+      // ─── Foreground queue (AIRA) ─────────────────────────────────────
+      // Daemon-local, per profile. fg-acquire stays open while the caller
+      // waits its turn; a caller that goes away is dequeued.
+      if (body.action === 'fg-acquire') {
+        if (typeof body.session !== 'string' || !body.session) {
+          jsonResponse(res, 400, { id: body.id, ok: false, error: 'fg-acquire needs session' });
+          return;
+        }
+        let replied = false;
+        const cancel = foregroundQueue.acquire(route.connection.contextId, {
+          session: body.session,
+          pid: Number(body.pid) || 0,
+          pidBound: body.pidBound === true,
+          mode: body.lease === 'task' ? 'task' : 'action',
+          command: typeof body.command === 'string' ? body.command.slice(0, 40) : 'input',
+          waitMs: typeof body.waitMs === 'number' ? body.waitMs : undefined,
+        }, (result) => {
+          replied = true;
+          if (result.ok) jsonResponse(res, 200, { id: body.id, ok: true, data: result });
+          else jsonResponse(res, 409, { id: body.id, ...result });
+        });
+        res.on('close', () => { if (!replied) cancel(); });
+        return;
+      }
+      if (body.action === 'fg-release') {
+        const released = typeof body.session === 'string' && foregroundQueue.release(route.connection.contextId, body.session);
+        jsonResponse(res, 200, { id: body.id, ok: true, data: { released } });
+        return;
+      }
+      if (body.action === 'fg-status') {
+        jsonResponse(res, 200, { id: body.id, ok: true, data: { lanes: foregroundQueue.status().filter((l) => l.profile === route.connection!.contextId) } });
+        return;
+      }
+      // Any command from the holding session keeps its lease alive.
+      foregroundQueue.touch(route.connection.contextId, typeof body.session === 'string' ? body.session : undefined);
 
       // Slot ownership: a holder's command refreshes its slot; a run that lost
       // its slot can no longer drive that tab.
@@ -559,7 +657,8 @@ const wss = new WebSocketServer({
     // ws://localhost:19825/ext and impersonate the Extension.  Real Chrome
     // Extensions send origin chrome-extension://<id>.
     const origin = req.headers['origin'] as string | undefined;
-    return !origin || origin.startsWith('chrome-extension://');
+    if (!HARDENED) return !origin || origin.startsWith('chrome-extension://');
+    return hostOk(req) && originAllowed(origin);
   },
 });
 

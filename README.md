@@ -1,3 +1,12 @@
+# AIRA OpenCLI
+
+> **This is the AIRA fork of [jackwener/opencli](https://github.com/jackwener/opencli)** (Apache-2.0), kept at `Signaturi4/aira-opencli`.
+> It adds verified precise clicks, a smart file upload and a one-tool MCP server (`act`) that lets a small, fast model drive the browser.
+> What is different and how to use it: [docs/aira/README.md](./docs/aira/README.md). Everything below is the upstream README.
+> The npm package name stays `@jackwener/opencli` so plugins and adapters keep working; the CLI is also installed as `aira-opencli`.
+
+---
+
 # OpenCLI
 
 > **Convert any website into a CLI & run Browser Use on your logged-in Chrome.**

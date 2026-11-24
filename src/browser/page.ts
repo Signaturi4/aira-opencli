@@ -9,6 +9,7 @@
  * page-scoped operations target the correct page without guessing.
  */
 
+import { ensureForeground } from './foreground.js';
 import type { BrowserCookie, BrowserDownloadWaitResult, BrowserEvaluateFunction, ScreenshotOptions } from '../types.js';
 import { sendCommand, sendCommandFull } from './daemon-client.js';
 import { buildEvaluateExpression } from './utils.js';
@@ -19,6 +20,34 @@ import { CDPBasePage, NativeInputVisibilityError } from './base-page.js';
 import { classifyBrowserError } from './errors.js';
 import { CommandExecutionError } from '../errors.js';
 import { log } from '../logger.js';
+import { execFile } from 'node:child_process';
+
+function runQuiet(cmd: string, args: string[], timeout = 4000): Promise<boolean> {
+  return new Promise((resolve) => {
+    execFile(cmd, args, { timeout }, (err) => resolve(!err));
+  });
+}
+
+/** AppleScript: raise the Chrome window whose active tab shows this URL, then bring Chrome forward. */
+function raiseChromeWindowScript(app: string, url: string): string {
+  const q = (s: string) => `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  return [
+    `tell application ${q(app)}`,
+    '  repeat with w in windows',
+    '    try',
+    `      if URL of active tab of w is ${q(url)} then`,
+    '        try',
+    '          set minimized of w to false',
+    '        end try',
+    '        set index of w to 1',
+    '        exit repeat',
+    '      end if',
+    '    end try',
+    '  end repeat',
+    '  activate',
+    'end tell',
+  ].join('\n');
+}
 
 function isUnsupportedNetworkCaptureError(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err);
@@ -252,6 +281,73 @@ export class Page extends CDPBasePage {
     }
   }
 
+  /**
+   * Called before every native input (AIRA).
+   *
+   * Measured on macOS, Chrome + extension 1.0.27: a page reports hidden when
+   * its tab is not the active one OR when another app covers the whole Chrome
+   * window. On a hidden page CDP mouse events are not reliable (lost on an
+   * inactive tab, about 2 s per event when they do arrive), key events are
+   * dropped, inserted text arrives. So:
+   *   1. take our turn in the foreground queue;
+   *   2. visible: trusted input as usual (returns false);
+   *   3. hidden and the window was asked for by name (`--window foreground`,
+   *      OPENCLI_RAISE_WINDOW=1): activate the tab, raise the window, re-check;
+   *   4. still hidden: mouse input throws, and the caller clicks inside the
+   *      page instead (untrusted, reported as click_method "dom"); text and
+   *      keys go on and return true, callers verify or fall back themselves.
+   * Nothing is brought to the front by default.
+   */
+  protected override async assertNativeInputVisible(kind?: 'mouse' | 'keys'): Promise<boolean> {
+    await ensureForeground({ session: this.session, contextId: this.contextId, preferredContextId: this.preferredContextId });
+    const visible = async (): Promise<boolean> => {
+      try { return (await this.evaluate('document.visibilityState')) === 'visible'; } catch { return false; }
+    };
+    // A page that cannot even answer gets no input at all.
+    try { await this.evaluate('document.visibilityState'); } catch (err) {
+      throw new NativeInputVisibilityError(`the visibility check failed (${err instanceof Error ? err.message : String(err)})`);
+    }
+    const waitVisible = async (ms: number): Promise<boolean> => {
+      const end = Date.now() + ms;
+      do {
+        if (await visible()) return true;
+        await new Promise((r) => setTimeout(r, 120));
+      } while (Date.now() < end);
+      return false;
+    };
+    if (await visible()) return false;
+    const strict = process.env.OPENCLI_INPUT_GUARD === 'strict';
+    const giveUp = (tried: string): boolean => {
+      if (strict || kind === 'mouse') throw new NativeInputVisibilityError(tried);
+      return true;
+    };
+    if (process.env.OPENCLI_RAISE_WINDOW !== '1') return giveUp('nothing: the page is hidden and the window was not asked to come forward');
+    const tried: string[] = [];
+    if (this._page) {
+      const keepUrl = this._lastUrl;
+      try { await this.selectTab(this._page); tried.push('activated the tab'); } catch { tried.push('could not activate the tab'); }
+      this._lastUrl = keepUrl;
+      if (await waitVisible(600)) return false;
+    }
+    if (process.platform === 'darwin') {
+      let url = '';
+      try { url = String(await this.evaluate('location.href')); } catch { /* raise without a url */ }
+      for (const app of ['Google Chrome', 'Chromium', 'Google Chrome Canary', 'Brave Browser', 'Microsoft Edge']) {
+        if (!(await runQuiet('pgrep', ['-x', app], 1500))) continue;
+        const scripted = await runQuiet('osascript', ['-e', raiseChromeWindowScript(app, url)]);
+        if (!scripted) await runQuiet('open', ['-a', app]);
+        tried.push(scripted ? `raised the ${app} window` : `brought ${app} forward (window not raised: allow Automation for this terminal in System Settings > Privacy)`);
+        if (await waitVisible(2500)) return false;
+      }
+    }
+    return giveUp(tried.join(', ') || 'nothing (no tab id)');
+  }
+
+  /** Public door to the foreground queue for actions that need the visible tab but send no input (screenshot). */
+  async takeForeground(command = 'input'): Promise<void> {
+    await ensureForeground({ session: this.session, contextId: this.contextId, preferredContextId: this.preferredContextId }, command);
+  }
+
   async selectTab(target: number | string): Promise<void> {
     const result = await sendCommandFull('tabs', {
       op: 'select',
@@ -367,7 +463,7 @@ export class Page extends CDPBasePage {
 
   /** Precise click using DOM.getContentQuads/getBoxModel for inline elements */
   async clickWithQuads(ref: string): Promise<void> {
-    await this.assertNativeInputVisible();
+    await this.assertNativeInputVisible('mouse');
     const safeRef = JSON.stringify(ref);
     const cssSelector = `[data-opencli-ref="${ref.replace(/"/g, '\\"')}"]`;
 
